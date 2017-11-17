@@ -1,3 +1,1 @@
-# public-sharing
-
-My public sharing for personal use.
+# For my personal use.
