@@ -1,0 +1,880 @@
+diff -Nurp a/arch/x86/include/asm/asm-prototypes.h b/arch/x86/include/asm/asm-prototypes.h
+--- a/arch/x86/include/asm/asm-prototypes.h	2018-02-03 08:50:31.840279298 +0100
++++ b/arch/x86/include/asm/asm-prototypes.h	2018-02-03 08:48:17.920158165 +0100
+@@ -12,7 +12,32 @@
+ #include <asm/preempt.h>
+ 
+ #include <asm/desc.h>
++#include <asm/asm.h>
+ 
+ #ifndef CONFIG_X86_CMPXCHG64
+ extern void cmpxchg8b_emu(void);
+ #endif
++
++#ifdef CONFIG_RETPOLINE
++#ifdef CONFIG_X86_32
++#define INDIRECT_THUNK(reg) extern asmlinkage void __x86_indirect_thunk_e ## reg(void);
++#else
++#define INDIRECT_THUNK(reg) extern asmlinkage void __x86_indirect_thunk_r ## reg(void);
++INDIRECT_THUNK(8)
++INDIRECT_THUNK(9)
++INDIRECT_THUNK(10)
++INDIRECT_THUNK(11)
++INDIRECT_THUNK(12)
++INDIRECT_THUNK(13)
++INDIRECT_THUNK(14)
++INDIRECT_THUNK(15)
++#endif
++INDIRECT_THUNK(ax)
++INDIRECT_THUNK(bx)
++INDIRECT_THUNK(cx)
++INDIRECT_THUNK(dx)
++INDIRECT_THUNK(si)
++INDIRECT_THUNK(di)
++INDIRECT_THUNK(bp)
++INDIRECT_THUNK(sp)
++#endif /* CONFIG_RETPOLINE */
+diff -Nurp a/arch/x86/include/asm/cpufeatures.h b/arch/x86/include/asm/cpufeatures.h
+--- a/arch/x86/include/asm/cpufeatures.h	2018-02-03 08:50:31.840279298 +0100
++++ b/arch/x86/include/asm/cpufeatures.h	2018-02-03 08:48:17.920158165 +0100
+@@ -192,6 +192,8 @@
+ 
+ #define X86_FEATURE_HW_PSTATE	( 7*32+ 8) /* AMD HW-PState */
+ #define X86_FEATURE_PROC_FEEDBACK ( 7*32+ 9) /* AMD ProcFeedbackInterface */
++#define X86_FEATURE_RETPOLINE		( 7*32+12) /* Generic Retpoline mitigation for Spectre variant 2 */
++#define X86_FEATURE_RETPOLINE_AMD	( 7*32+13) /* AMD Retpoline mitigation for Spectre variant 2 */
+ 
+ #define X86_FEATURE_INTEL_PT	( 7*32+15) /* Intel Processor Trace */
+ #define X86_FEATURE_AVX512_4VNNIW (7*32+16) /* AVX-512 Neural Network Instructions */
+diff -Nurp a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+--- a/arch/x86/include/asm/nospec-branch.h	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/include/asm/nospec-branch.h	2018-02-03 08:48:17.920158165 +0100
+@@ -0,0 +1,218 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef __NOSPEC_BRANCH_H__
++#define __NOSPEC_BRANCH_H__
++
++#include <asm/alternative.h>
++#include <asm/alternative-asm.h>
++#include <asm/cpufeatures.h>
++
++/*
++ * Fill the CPU return stack buffer.
++ *
++ * Each entry in the RSB, if used for a speculative 'ret', contains an
++ * infinite 'pause; lfence; jmp' loop to capture speculative execution.
++ *
++ * This is required in various cases for retpoline and IBRS-based
++ * mitigations for the Spectre variant 2 vulnerability. Sometimes to
++ * eliminate potentially bogus entries from the RSB, and sometimes
++ * purely to ensure that it doesn't get empty, which on some CPUs would
++ * allow predictions from other (unwanted!) sources to be used.
++ *
++ * We define a CPP macro such that it can be used from both .S files and
++ * inline assembly. It's possible to do a .macro and then include that
++ * from C via asm(".include <asm/nospec-branch.h>") but let's not go there.
++ */
++
++#define RSB_CLEAR_LOOPS		32	/* To forcibly overwrite all entries */
++#define RSB_FILL_LOOPS		16	/* To avoid underflow */
++
++/*
++ * Google experimented with loop-unrolling and this turned out to be
++ * the optimal version — two calls, each with their own speculation
++ * trap should their return address end up getting used, in a loop.
++ */
++#define __FILL_RETURN_BUFFER(reg, nr, sp)	\
++	mov	$(nr/2), reg;			\
++771:						\
++	call	772f;				\
++773:	/* speculation trap */			\
++	pause;					\
++	lfence;					\
++	jmp	773b;				\
++772:						\
++	call	774f;				\
++775:	/* speculation trap */			\
++	pause;					\
++	lfence;					\
++	jmp	775b;				\
++774:						\
++	dec	reg;				\
++	jnz	771b;				\
++	add	$(BITS_PER_LONG/8) * nr, sp;
++
++#ifdef __ASSEMBLY__
++
++/*
++ * This should be used immediately before a retpoline alternative.  It tells
++ * objtool where the retpolines are so that it can make sense of the control
++ * flow by just reading the original instruction(s) and ignoring the
++ * alternatives.
++ */
++.macro ANNOTATE_NOSPEC_ALTERNATIVE
++	.Lannotate_\@:
++	.pushsection .discard.nospec
++	.long .Lannotate_\@ - .
++	.popsection
++.endm
++
++/*
++ * These are the bare retpoline primitives for indirect jmp and call.
++ * Do not use these directly; they only exist to make the ALTERNATIVE
++ * invocation below less ugly.
++ */
++.macro RETPOLINE_JMP reg:req
++	call	.Ldo_rop_\@
++.Lspec_trap_\@:
++	pause
++	lfence
++	jmp	.Lspec_trap_\@
++.Ldo_rop_\@:
++	mov	\reg, (%_ASM_SP)
++	ret
++.endm
++
++/*
++ * This is a wrapper around RETPOLINE_JMP so the called function in reg
++ * returns to the instruction after the macro.
++ */
++.macro RETPOLINE_CALL reg:req
++	jmp	.Ldo_call_\@
++.Ldo_retpoline_jmp_\@:
++	RETPOLINE_JMP \reg
++.Ldo_call_\@:
++	call	.Ldo_retpoline_jmp_\@
++.endm
++
++/*
++ * JMP_NOSPEC and CALL_NOSPEC macros can be used instead of a simple
++ * indirect jmp/call which may be susceptible to the Spectre variant 2
++ * attack.
++ */
++.macro JMP_NOSPEC reg:req
++#ifdef CONFIG_RETPOLINE
++	ANNOTATE_NOSPEC_ALTERNATIVE
++	ALTERNATIVE_2 __stringify(jmp *\reg),				\
++		__stringify(RETPOLINE_JMP \reg), X86_FEATURE_RETPOLINE,	\
++		__stringify(lfence; jmp *\reg), X86_FEATURE_RETPOLINE_AMD
++#else
++	jmp	*\reg
++#endif
++.endm
++
++.macro CALL_NOSPEC reg:req
++#ifdef CONFIG_RETPOLINE
++	ANNOTATE_NOSPEC_ALTERNATIVE
++	ALTERNATIVE_2 __stringify(call *\reg),				\
++		__stringify(RETPOLINE_CALL \reg), X86_FEATURE_RETPOLINE,\
++		__stringify(lfence; call *\reg), X86_FEATURE_RETPOLINE_AMD
++#else
++	call	*\reg
++#endif
++.endm
++
++ /*
++  * A simpler FILL_RETURN_BUFFER macro. Don't make people use the CPP
++  * monstrosity above, manually.
++  */
++.macro FILL_RETURN_BUFFER reg:req nr:req ftr:req
++#ifdef CONFIG_RETPOLINE
++	ANNOTATE_NOSPEC_ALTERNATIVE
++	ALTERNATIVE "jmp .Lskip_rsb_\@",				\
++		__stringify(__FILL_RETURN_BUFFER(\reg,\nr,%_ASM_SP))	\
++		\ftr
++.Lskip_rsb_\@:
++#endif
++.endm
++
++#else /* __ASSEMBLY__ */
++
++#define ANNOTATE_NOSPEC_ALTERNATIVE				\
++	"999:\n\t"						\
++	".pushsection .discard.nospec\n\t"			\
++	".long 999b - .\n\t"					\
++	".popsection\n\t"
++
++#if defined(CONFIG_X86_64) && defined(RETPOLINE)
++
++/*
++ * Since the inline asm uses the %V modifier which is only in newer GCC,
++ * the 64-bit one is dependent on RETPOLINE not CONFIG_RETPOLINE.
++ */
++# define CALL_NOSPEC						\
++	ANNOTATE_NOSPEC_ALTERNATIVE				\
++	ALTERNATIVE(						\
++	"call *%[thunk_target]\n",				\
++	"call __x86_indirect_thunk_%V[thunk_target]\n",		\
++	X86_FEATURE_RETPOLINE)
++# define THUNK_TARGET(addr) [thunk_target] "r" (addr)
++
++#elif defined(CONFIG_X86_32) && defined(CONFIG_RETPOLINE)
++/*
++ * For i386 we use the original ret-equivalent retpoline, because
++ * otherwise we'll run out of registers. We don't care about CET
++ * here, anyway.
++ */
++# define CALL_NOSPEC ALTERNATIVE("call *%[thunk_target]\n",	\
++	"       jmp    904f;\n"					\
++	"       .align 16\n"					\
++	"901:	call   903f;\n"					\
++	"902:	pause;\n"					\
++	"    	lfence;\n"					\
++	"       jmp    902b;\n"					\
++	"       .align 16\n"					\
++	"903:	addl   $4, %%esp;\n"				\
++	"       pushl  %[thunk_target];\n"			\
++	"       ret;\n"						\
++	"       .align 16\n"					\
++	"904:	call   901b;\n",				\
++	X86_FEATURE_RETPOLINE)
++
++# define THUNK_TARGET(addr) [thunk_target] "rm" (addr)
++#else /* No retpoline for C / inline asm */
++# define CALL_NOSPEC "call *%[thunk_target]\n"
++# define THUNK_TARGET(addr) [thunk_target] "rm" (addr)
++#endif
++
++/* The Spectre V2 mitigation variants */
++enum spectre_v2_mitigation {
++	SPECTRE_V2_NONE,
++	SPECTRE_V2_RETPOLINE_MINIMAL,
++	SPECTRE_V2_RETPOLINE_MINIMAL_AMD,
++	SPECTRE_V2_RETPOLINE_GENERIC,
++	SPECTRE_V2_RETPOLINE_AMD,
++	SPECTRE_V2_IBRS,
++};
++
++/*
++ * On VMEXIT we must ensure that no RSB predictions learned in the guest
++ * can be followed in the host, by overwriting the RSB completely. Both
++ * retpoline and IBRS mitigations for Spectre v2 need this; only on future
++ * CPUs with IBRS_ATT *might* it be avoided.
++ */
++static inline void vmexit_fill_RSB(void)
++{
++#ifdef CONFIG_RETPOLINE
++	unsigned long loops = RSB_CLEAR_LOOPS / 2;
++
++	asm volatile (ANNOTATE_NOSPEC_ALTERNATIVE
++		      ALTERNATIVE("jmp 910f",
++				  __stringify(__FILL_RETURN_BUFFER(%0, RSB_CLEAR_LOOPS, %1)),
++				  X86_FEATURE_RETPOLINE)
++		      "910:"
++		      : "=&r" (loops), ASM_CALL_CONSTRAINT
++		      : "r" (loops) : "memory" );
++#endif
++}
++#endif /* __ASSEMBLY__ */
++#endif /* __NOSPEC_BRANCH_H__ */
+diff -Nurp a/arch/x86/Kconfig b/arch/x86/Kconfig
+--- a/arch/x86/Kconfig	2018-02-03 08:50:31.820279279 +0100
++++ b/arch/x86/Kconfig	2018-02-03 08:48:17.924158168 +0100
+@@ -63,6 +63,7 @@ config X86
+ 	select GENERIC_CLOCKEVENTS_MIN_ADJUST
+ 	select GENERIC_CMOS_UPDATE
+ 	select GENERIC_CPU_AUTOPROBE
++	select GENERIC_CPU_VULNERABILITIES
+ 	select GENERIC_EARLY_IOREMAP
+ 	select GENERIC_FIND_FIRST_BIT
+ 	select GENERIC_IOMAP
+@@ -409,6 +410,19 @@ config GOLDFISH
+        def_bool y
+        depends on X86_GOLDFISH
+ 
++config RETPOLINE
++	bool "Avoid speculative indirect branches in kernel"
++	default y
++	help
++	  Compile kernel with the retpoline compiler options to guard against
++	  kernel-to-user data leaks by avoiding speculative indirect
++	  branches. Requires a compiler with -mindirect-branch=thunk-extern
++	  support for full protection. The kernel may run slower.
++
++	  Without compiler support, at least indirect branches in assembler
++	  code are eliminated. Since this includes the syscall entry path,
++	  it is not entirely pointless.
++
+ if X86_32
+ config X86_EXTENDED_PLATFORM
+ 	bool "Support for extended (non-PC) x86 platforms"
+diff -Nurp a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+--- a/arch/x86/kernel/cpu/bugs.c	2018-01-02 20:35:18.000000000 +0100
++++ b/arch/x86/kernel/cpu/bugs.c	2018-02-03 08:48:17.924158168 +0100
+@@ -9,6 +9,10 @@
+  */
+ #include <linux/init.h>
+ #include <linux/utsname.h>
++#include <linux/cpu.h>
++
++#include <asm/nospec-branch.h>
++#include <asm/cmdline.h>
+ #include <asm/bugs.h>
+ #include <asm/processor.h>
+ #include <asm/processor-flags.h>
+@@ -17,6 +21,8 @@
+ #include <asm/paravirt.h>
+ #include <asm/alternative.h>
+ 
++static void __init spectre_v2_select_mitigation(void);
++
+ void __init check_bugs(void)
+ {
+ #ifdef CONFIG_X86_32
+@@ -33,6 +39,9 @@ void __init check_bugs(void)
+ 	print_cpu_info(&boot_cpu_data);
+ #endif
+ 
++	/* Select the proper spectre mitigation before patching alternatives */
++	spectre_v2_select_mitigation();
++
+ 	/*
+ 	 * Check whether we are able to run this kernel safely on SMP.
+ 	 *
+@@ -49,3 +58,179 @@ void __init check_bugs(void)
+ 
+ 	fpu__init_check_bugs();
+ }
++
++/* The kernel command line selection */
++enum spectre_v2_mitigation_cmd {
++	SPECTRE_V2_CMD_NONE,
++	SPECTRE_V2_CMD_AUTO,
++	SPECTRE_V2_CMD_FORCE,
++	SPECTRE_V2_CMD_RETPOLINE,
++	SPECTRE_V2_CMD_RETPOLINE_GENERIC,
++	SPECTRE_V2_CMD_RETPOLINE_AMD,
++};
++
++static const char *spectre_v2_strings[] = {
++	[SPECTRE_V2_NONE]			= "Vulnerable",
++	[SPECTRE_V2_RETPOLINE_MINIMAL]		= "Vulnerable: Minimal generic ASM retpoline",
++	[SPECTRE_V2_RETPOLINE_MINIMAL_AMD]	= "Vulnerable: Minimal AMD ASM retpoline",
++	[SPECTRE_V2_RETPOLINE_GENERIC]		= "Mitigation: Full generic retpoline",
++	[SPECTRE_V2_RETPOLINE_AMD]		= "Mitigation: Full AMD retpoline",
++};
++
++#undef pr_fmt
++#define pr_fmt(fmt)     "Spectre V2 mitigation: " fmt
++
++static enum spectre_v2_mitigation spectre_v2_enabled = SPECTRE_V2_NONE;
++
++static void __init spec2_print_if_insecure(const char *reason)
++{
++	if (boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++		pr_info("%s\n", reason);
++}
++
++static void __init spec2_print_if_secure(const char *reason)
++{
++	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++		pr_info("%s\n", reason);
++}
++
++static inline bool retp_compiler(void)
++{
++	return __is_defined(RETPOLINE);
++}
++
++static inline bool match_option(const char *arg, int arglen, const char *opt)
++{
++	int len = strlen(opt);
++
++	return len == arglen && !strncmp(arg, opt, len);
++}
++
++static enum spectre_v2_mitigation_cmd __init spectre_v2_parse_cmdline(void)
++{
++	char arg[20];
++	int ret;
++
++	ret = cmdline_find_option(boot_command_line, "spectre_v2", arg,
++				  sizeof(arg));
++	if (ret > 0)  {
++		if (match_option(arg, ret, "off")) {
++			goto disable;
++		} else if (match_option(arg, ret, "on")) {
++			spec2_print_if_secure("force enabled on command line.");
++			return SPECTRE_V2_CMD_FORCE;
++		} else if (match_option(arg, ret, "retpoline")) {
++			spec2_print_if_insecure("retpoline selected on command line.");
++			return SPECTRE_V2_CMD_RETPOLINE;
++		} else if (match_option(arg, ret, "retpoline,amd")) {
++			if (boot_cpu_data.x86_vendor != X86_VENDOR_AMD) {
++				pr_err("retpoline,amd selected but CPU is not AMD. Switching to AUTO select\n");
++				return SPECTRE_V2_CMD_AUTO;
++			}
++			spec2_print_if_insecure("AMD retpoline selected on command line.");
++			return SPECTRE_V2_CMD_RETPOLINE_AMD;
++		} else if (match_option(arg, ret, "retpoline,generic")) {
++			spec2_print_if_insecure("generic retpoline selected on command line.");
++			return SPECTRE_V2_CMD_RETPOLINE_GENERIC;
++		} else if (match_option(arg, ret, "auto")) {
++			return SPECTRE_V2_CMD_AUTO;
++		}
++	}
++
++	if (!cmdline_find_option_bool(boot_command_line, "nospectre_v2"))
++		return SPECTRE_V2_CMD_AUTO;
++disable:
++	spec2_print_if_insecure("disabled on command line.");
++	return SPECTRE_V2_CMD_NONE;
++}
++
++static void __init spectre_v2_select_mitigation(void)
++{
++	enum spectre_v2_mitigation_cmd cmd = spectre_v2_parse_cmdline();
++	enum spectre_v2_mitigation mode = SPECTRE_V2_NONE;
++
++	/*
++	 * If the CPU is not affected and the command line mode is NONE or AUTO
++	 * then nothing to do.
++	 */
++	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2) &&
++	    (cmd == SPECTRE_V2_CMD_NONE || cmd == SPECTRE_V2_CMD_AUTO))
++		return;
++
++	switch (cmd) {
++	case SPECTRE_V2_CMD_NONE:
++		return;
++
++	case SPECTRE_V2_CMD_FORCE:
++		/* FALLTRHU */
++	case SPECTRE_V2_CMD_AUTO:
++		goto retpoline_auto;
++
++	case SPECTRE_V2_CMD_RETPOLINE_AMD:
++		if (IS_ENABLED(CONFIG_RETPOLINE))
++			goto retpoline_amd;
++		break;
++	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
++		if (IS_ENABLED(CONFIG_RETPOLINE))
++			goto retpoline_generic;
++		break;
++	case SPECTRE_V2_CMD_RETPOLINE:
++		if (IS_ENABLED(CONFIG_RETPOLINE))
++			goto retpoline_auto;
++		break;
++	}
++	pr_err("kernel not compiled with retpoline; no mitigation available!");
++	return;
++
++retpoline_auto:
++	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
++	retpoline_amd:
++		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
++			pr_err("LFENCE not serializing. Switching to generic retpoline\n");
++			goto retpoline_generic;
++		}
++		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_AMD :
++					 SPECTRE_V2_RETPOLINE_MINIMAL_AMD;
++		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
++		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
++	} else {
++	retpoline_generic:
++		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_GENERIC :
++					 SPECTRE_V2_RETPOLINE_MINIMAL;
++		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
++	}
++
++	spectre_v2_enabled = mode;
++	pr_info("%s\n", spectre_v2_strings[mode]);
++}
++
++#undef pr_fmt
++
++#ifdef CONFIG_SYSFS
++ssize_t cpu_show_meltdown(struct device *dev,
++			  struct device_attribute *attr, char *buf)
++{
++	if (!boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN))
++		return sprintf(buf, "Not affected\n");
++	if (boot_cpu_has(X86_FEATURE_KAISER))
++		return sprintf(buf, "Mitigation: PTI\n");
++	return sprintf(buf, "Vulnerable\n");
++}
++
++ssize_t cpu_show_spectre_v1(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V1))
++		return sprintf(buf, "Not affected\n");
++	return sprintf(buf, "Vulnerable\n");
++}
++
++ssize_t cpu_show_spectre_v2(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++		return sprintf(buf, "Not affected\n");
++
++	return sprintf(buf, "%s\n", spectre_v2_strings[spectre_v2_enabled]);
++}
++#endif
+diff -Nurp a/arch/x86/lib/Makefile b/arch/x86/lib/Makefile
+--- a/arch/x86/lib/Makefile	2018-02-03 08:50:31.872279328 +0100
++++ b/arch/x86/lib/Makefile	2018-02-03 08:48:17.928158172 +0100
+@@ -25,6 +25,7 @@ lib-y += memcpy_$(BITS).o
+ lib-$(CONFIG_RWSEM_XCHGADD_ALGORITHM) += rwsem.o
+ lib-$(CONFIG_INSTRUCTION_DECODER) += insn.o inat.o
+ lib-$(CONFIG_RANDOMIZE_BASE) += kaslr.o
++lib-$(CONFIG_RETPOLINE) += retpoline.o
+ 
+ obj-y += msr.o msr-reg.o msr-reg-export.o hweight.o
+ 
+diff -Nurp a/arch/x86/lib/retpoline.S b/arch/x86/lib/retpoline.S
+--- a/arch/x86/lib/retpoline.S	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/lib/retpoline.S	2018-02-03 08:48:17.928158172 +0100
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#include <linux/stringify.h>
++#include <linux/linkage.h>
++#include <asm/dwarf2.h>
++#include <asm/cpufeatures.h>
++#include <asm/alternative-asm.h>
++#include <asm/export.h>
++#include <asm/nospec-branch.h>
++
++.macro THUNK reg
++	.section .text.__x86.indirect_thunk.\reg
++
++ENTRY(__x86_indirect_thunk_\reg)
++	CFI_STARTPROC
++	JMP_NOSPEC %\reg
++	CFI_ENDPROC
++ENDPROC(__x86_indirect_thunk_\reg)
++.endm
++
++/*
++ * Despite being an assembler file we can't just use .irp here
++ * because __KSYM_DEPS__ only uses the C preprocessor and would
++ * only see one instance of "__x86_indirect_thunk_\reg" rather
++ * than one per register with the correct names. So we do it
++ * the simple and nasty way...
++ */
++#define EXPORT_THUNK(reg) EXPORT_SYMBOL(__x86_indirect_thunk_ ## reg)
++#define GENERATE_THUNK(reg) THUNK reg ; EXPORT_THUNK(reg)
++
++GENERATE_THUNK(_ASM_AX)
++GENERATE_THUNK(_ASM_BX)
++GENERATE_THUNK(_ASM_CX)
++GENERATE_THUNK(_ASM_DX)
++GENERATE_THUNK(_ASM_SI)
++GENERATE_THUNK(_ASM_DI)
++GENERATE_THUNK(_ASM_BP)
++GENERATE_THUNK(_ASM_SP)
++#ifdef CONFIG_64BIT
++GENERATE_THUNK(r8)
++GENERATE_THUNK(r9)
++GENERATE_THUNK(r10)
++GENERATE_THUNK(r11)
++GENERATE_THUNK(r12)
++GENERATE_THUNK(r13)
++GENERATE_THUNK(r14)
++GENERATE_THUNK(r15)
++#endif
+diff -Nurp a/arch/x86/Makefile b/arch/x86/Makefile
+--- a/arch/x86/Makefile	2018-02-03 08:50:31.820279279 +0100
++++ b/arch/x86/Makefile	2018-02-03 08:48:17.928158172 +0100
+@@ -182,6 +182,16 @@ KBUILD_CFLAGS += -fno-asynchronous-unwin
+ KBUILD_CFLAGS += $(mflags-y)
+ KBUILD_AFLAGS += $(mflags-y)
+ 
++# Avoid indirect branches in kernel to deal with Spectre
++ifdef CONFIG_RETPOLINE
++    RETPOLINE_CFLAGS += $(call cc-option,-mindirect-branch=thunk-extern -mindirect-branch-register)
++    ifneq ($(RETPOLINE_CFLAGS),)
++        KBUILD_CFLAGS += $(RETPOLINE_CFLAGS) -DRETPOLINE
++    else
++        $(warning CONFIG_RETPOLINE=y, but not supported by the compiler. Toolchain update recommended.)
++    endif
++endif
++
+ archscripts: scripts_basic
+ 	$(Q)$(MAKE) $(build)=arch/x86/tools relocs
+ 
+diff -Nurp a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+--- a/Documentation/kernel-parameters.txt	2018-02-03 08:50:31.772279237 +0100
++++ b/Documentation/kernel-parameters.txt	2018-02-03 08:48:17.932158175 +0100
+@@ -2701,6 +2701,11 @@ bytes respectively. Such letter suffixes
+ 	nosmt		[KNL,S390] Disable symmetric multithreading (SMT).
+ 			Equivalent to smt=1.
+ 
++	nospectre_v2	[X86] Disable all mitigations for the Spectre variant 2
++			(indirect branch prediction) vulnerability. System may
++			allow data leaks with this option, which is equivalent
++			to spectre_v2=off.
++
+ 	noxsave		[BUGS=X86] Disables x86 extended register state save
+ 			and restore using xsave. The kernel will fallback to
+ 			enabling legacy floating-point and sse state.
+@@ -3966,6 +3971,29 @@ bytes respectively. Such letter suffixes
+ 	sonypi.*=	[HW] Sony Programmable I/O Control Device driver
+ 			See Documentation/laptops/sonypi.txt
+ 
++	spectre_v2=	[X86] Control mitigation of Spectre variant 2
++			(indirect branch speculation) vulnerability.
++
++			on   - unconditionally enable
++			off  - unconditionally disable
++			auto - kernel detects whether your CPU model is
++			       vulnerable
++
++			Selecting 'on' will, and 'auto' may, choose a
++			mitigation method at run time according to the
++			CPU, the available microcode, the setting of the
++			CONFIG_RETPOLINE configuration option, and the
++			compiler with which the kernel was built.
++
++			Specific mitigations can also be selected manually:
++
++			retpoline	  - replace indirect branches
++			retpoline,generic - google's original retpoline
++			retpoline,amd     - AMD-specific minimal thunk
++
++			Not specifying this option is equivalent to
++			spectre_v2=auto.
++
+ 	spia_io_base=	[HW,MTD]
+ 	spia_fio_base=
+ 	spia_pedr=
+diff -Nurp a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig	2018-02-03 08:50:32.336279746 +0100
++++ b/init/Kconfig	2018-02-03 08:48:17.932158175 +0100
+@@ -1615,6 +1615,13 @@ config BPF_SYSCALL
+ 	  Enable the bpf() system call that allows to manipulate eBPF
+ 	  programs and maps via file descriptors.
+ 
++config BPF_JIT_ALWAYS_ON
++	bool "Permanently enable BPF JIT and remove BPF interpreter"
++	depends on BPF_SYSCALL && HAVE_EBPF_JIT && BPF_JIT
++	help
++	  Enables BPF JIT and removes BPF interpreter to avoid
++	  speculative execution of BPF instructions by the interpreter
++
+ config SHMEM
+ 	bool "Use full shmem filesystem" if EXPERT
+ 	default y
+diff -Nurp a/kernel/bpf/core.c b/kernel/bpf/core.c
+--- a/kernel/bpf/core.c	2018-02-03 08:50:32.340279750 +0100
++++ b/kernel/bpf/core.c	2018-02-03 08:48:17.932158175 +0100
+@@ -478,6 +478,7 @@ noinline u64 __bpf_call_base(u64 r1, u64
+ }
+ EXPORT_SYMBOL_GPL(__bpf_call_base);
+ 
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ /**
+  *	__bpf_prog_run - run eBPF program on a given context
+  *	@ctx: is the data we are operating on
+@@ -943,6 +944,13 @@ load_byte:
+ }
+ STACK_FRAME_NON_STANDARD(__bpf_prog_run); /* jump table */
+ 
++#else
++static unsigned int __bpf_prog_ret0(void *ctx, const struct bpf_insn *insn)
++{
++	return 0;
++}
++#endif
++
+ bool bpf_prog_array_compatible(struct bpf_array *array,
+ 			       const struct bpf_prog *fp)
+ {
+@@ -990,7 +998,11 @@ static int bpf_check_tail_call(const str
+  */
+ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
+ {
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ 	fp->bpf_func = __bpf_prog_run;
++#else
++	fp->bpf_func = (void *) __bpf_prog_ret0;
++#endif
+ 
+ 	/* eBPF JITs can rewrite the program in case constant
+ 	 * blinding is active. However, in case of error during
+@@ -999,6 +1011,12 @@ struct bpf_prog *bpf_prog_select_runtime
+ 	 * be JITed, but falls back to the interpreter.
+ 	 */
+ 	fp = bpf_int_jit_compile(fp);
++#ifdef CONFIG_BPF_JIT_ALWAYS_ON
++	if (!fp->jited) {
++		*err = -ENOTSUPP;
++		return fp;
++	}
++#endif
+ 	bpf_prog_lock_ro(fp);
+ 
+ 	/* The tail call compatibility check can only be done at
+diff -Nurp a/lib/test_bpf.c b/lib/test_bpf.c
+--- a/lib/test_bpf.c	2018-01-02 20:35:18.000000000 +0100
++++ b/lib/test_bpf.c	2018-02-03 08:48:17.936158179 +0100
+@@ -5646,9 +5646,8 @@ static struct bpf_prog *generate_filter(
+ 				return NULL;
+ 			}
+ 		}
+-		/* We don't expect to fail. */
+ 		if (*err) {
+-			pr_cont("FAIL to attach err=%d len=%d\n",
++			pr_cont("FAIL to prog_create err=%d len=%d\n",
+ 				*err, fprog.len);
+ 			return NULL;
+ 		}
+@@ -5671,6 +5670,10 @@ static struct bpf_prog *generate_filter(
+ 		 * checks.
+ 		 */
+ 		fp = bpf_prog_select_runtime(fp, err);
++		if (*err) {
++			pr_cont("FAIL to select_runtime err=%d\n", *err);
++			return NULL;
++		}
+ 		break;
+ 	}
+ 
+@@ -5856,8 +5859,8 @@ static __init int test_bpf(void)
+ 				pass_cnt++;
+ 				continue;
+ 			}
+-
+-			return err;
++			err_cnt++;
++			continue;
+ 		}
+ 
+ 		pr_cont("jited:%u ", fp->jited);
+diff -Nurp a/net/core/filter.c b/net/core/filter.c
+--- a/net/core/filter.c	2018-02-03 08:50:32.400279804 +0100
++++ b/net/core/filter.c	2018-02-03 08:48:17.936158179 +0100
+@@ -1009,11 +1009,9 @@ static struct bpf_prog *bpf_migrate_filt
+ 		 */
+ 		goto out_err_free;
+ 
+-	/* We are guaranteed to never error here with cBPF to eBPF
+-	 * transitions, since there's no issue with type compatibility
+-	 * checks on program arrays.
+-	 */
+ 	fp = bpf_prog_select_runtime(fp, &err);
++	if (err)
++		goto out_err_free;
+ 
+ 	kfree(old_prog);
+ 	return fp;
+diff -Nurp a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+--- a/net/core/sysctl_net_core.c	2018-02-03 08:50:32.404279809 +0100
++++ b/net/core/sysctl_net_core.c	2018-02-03 08:48:17.936158179 +0100
+@@ -292,7 +292,13 @@ static struct ctl_table net_core_table[]
+ 		.data		= &bpf_jit_enable,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ 		.proc_handler	= proc_dointvec
++#else
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one,
++		.extra2		= &one,
++#endif
+ 	},
+ # ifdef CONFIG_HAVE_EBPF_JIT
+ 	{
+diff -Nurp a/net/socket.c b/net/socket.c
+--- a/net/socket.c	2018-02-03 08:50:32.444279844 +0100
++++ b/net/socket.c	2018-02-03 08:48:17.936158179 +0100
+@@ -2613,6 +2613,15 @@ out_fs:
+ 
+ core_initcall(sock_init);	/* early initcall */
+ 
++static int __init jit_init(void)
++{
++#ifdef CONFIG_BPF_JIT_ALWAYS_ON
++	bpf_jit_enable = 1;
++#endif
++	return 0;
++}
++pure_initcall(jit_init);
++
+ #ifdef CONFIG_PROC_FS
+ void socket_seq_show(struct seq_file *seq)
+ {
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index b601dda..29a554e 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -330,6 +330,8 @@
+ #define FAM10H_MMIO_CONF_BASE_MASK	0xfffffffULL
+ #define FAM10H_MMIO_CONF_BASE_SHIFT	20
+ #define MSR_FAM10H_NODE_ID		0xc001100c
++#define MSR_F10H_DECFG			0xc0011029
++#define MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT	1
+ 
+ /* K8 MSRs */
+ #define MSR_K8_TOP_MEM1			0xc001001a
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 2b4cf04..8b5b19d 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -782,6 +782,16 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 		set_cpu_cap(c, X86_FEATURE_K8);
+ 
+ 	if (cpu_has(c, X86_FEATURE_XMM2)) {
++		/*
++		 * A serializing LFENCE has less overhead than MFENCE, so
++		 * use it for execution serialization.  On families which
++		 * don't have that MSR, LFENCE is already serializing.
++		 * msr_set_bit() uses the safe accessors, too, even if the MSR
++		 * is not present.
++		 */
++		msr_set_bit(MSR_F10H_DECFG,
++			    MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT);
++
+ 		/* MFENCE stops RDTSC speculation */
+ 		set_cpu_cap(c, X86_FEATURE_MFENCE_RDTSC);
+ 	}
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 29a554e..b11c4c0 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -332,6 +332,7 @@
+ #define MSR_FAM10H_NODE_ID		0xc001100c
+ #define MSR_F10H_DECFG			0xc0011029
+ #define MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT	1
++#define MSR_F10H_DECFG_LFENCE_SERIALIZE		BIT_ULL(MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT)
+ 
+ /* K8 MSRs */
+ #define MSR_K8_TOP_MEM1			0xc001001a
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 8b5b19d..1b89f0c 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -782,6 +782,9 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 		set_cpu_cap(c, X86_FEATURE_K8);
+ 
+ 	if (cpu_has(c, X86_FEATURE_XMM2)) {
++		unsigned long long val;
++		int ret;
++
+ 		/*
+ 		 * A serializing LFENCE has less overhead than MFENCE, so
+ 		 * use it for execution serialization.  On families which
+@@ -792,8 +795,19 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 		msr_set_bit(MSR_F10H_DECFG,
+ 			    MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT);
+ 
+-		/* MFENCE stops RDTSC speculation */
+-		set_cpu_cap(c, X86_FEATURE_MFENCE_RDTSC);
++		/*
++		 * Verify that the MSR write was successful (could be running
++		 * under a hypervisor) and only then assume that LFENCE is
++		 * serializing.
++		 */
++		ret = rdmsrl_safe(MSR_F10H_DECFG, &val);
++		if (!ret && (val & MSR_F10H_DECFG_LFENCE_SERIALIZE)) {
++			/* A serializing LFENCE stops RDTSC speculation */
++			set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
++		} else {
++			/* MFENCE stops RDTSC speculation */
++			set_cpu_cap(c, X86_FEATURE_MFENCE_RDTSC);
++		}
+ 	}
+ 
+ 	/*
