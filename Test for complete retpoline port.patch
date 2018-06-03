@@ -1,0 +1,184 @@
+diff -Nurp a/arch/x86/crypto/aesni-intel_asm.S b/arch/x86/crypto/aesni-intel_asm.S
+--- a/arch/x86/crypto/aesni-intel_asm.S	2018-06-03 23:05:45.837553206 +0200
++++ b/arch/x86/crypto/aesni-intel_asm.S	2018-06-03 22:53:50.847263054 +0200
+@@ -33,6 +33,7 @@
+ #include <asm/inst.h>
+ #include <asm/frame.h>
+ #include <asm/alternative-asm.h>
++#include <asm/nospec-branch.h>
+ 
+ /*
+  * The following macros are used to move an (un)aligned 16 byte value to/from
+@@ -2735,7 +2736,7 @@ ENTRY(aesni_xts_crypt8)
+ 	pxor INC, STATE4
+ 	movdqu IV, 0x30(OUTP)
+ 
+-	pax_indirect_call "%r11", _aesni_enc4
++	CALL_NOSPEC %r11
+ 
+ 	movdqu 0x00(OUTP), INC
+ 	pxor INC, STATE1
+@@ -2780,7 +2781,7 @@ ENTRY(aesni_xts_crypt8)
+ 	_aesni_gf128mul_x_ble()
+ 	movups IV, (IVP)
+ 
+-	pax_indirect_call "%r11", _aesni_enc4
++	CALL_NOSPEC %r11
+ 
+ 	movdqu 0x40(OUTP), INC
+ 	pxor INC, STATE1
+diff -Nurp a/arch/x86/crypto/camellia-aesni-avx2-asm_64.S b/arch/x86/crypto/camellia-aesni-avx2-asm_64.S
+--- a/arch/x86/crypto/camellia-aesni-avx2-asm_64.S	2018-06-03 23:05:45.837553206 +0200
++++ b/arch/x86/crypto/camellia-aesni-avx2-asm_64.S	2018-06-03 22:54:46.355432502 +0200
+@@ -13,6 +13,7 @@
+ #include <linux/linkage.h>
+ #include <asm/frame.h>
+ #include <asm/alternative-asm.h>
++#include <asm/nospec-branch.h>
+ 
+ #define CAMELLIA_TABLE_BYTE_LEN 272
+ 
+@@ -1338,7 +1339,7 @@ camellia_xts_crypt_32way:
+ 	vpxor 14 * 32(%rax), %ymm15, %ymm14;
+ 	vpxor 15 * 32(%rax), %ymm15, %ymm15;
+ 
+-	pax_indirect_call "%r9", __camellia_enc_blk32;
++	CALL_NOSPEC %r9;
+ 
+ 	addq $(16 * 32), %rsp;
+ 
+diff -Nurp a/arch/x86/crypto/camellia-aesni-avx-asm_64.S b/arch/x86/crypto/camellia-aesni-avx-asm_64.S
+--- a/arch/x86/crypto/camellia-aesni-avx-asm_64.S	2018-06-03 23:05:45.837553206 +0200
++++ b/arch/x86/crypto/camellia-aesni-avx-asm_64.S	2018-06-03 22:55:50.683629734 +0200
+@@ -18,6 +18,7 @@
+ #include <linux/linkage.h>
+ #include <asm/frame.h>
+ #include <asm/alternative-asm.h>
++#include <asm/nospec-branch.h>
+ 
+ #define CAMELLIA_TABLE_BYTE_LEN 272
+ 
+@@ -1225,7 +1226,7 @@ camellia_xts_crypt_16way:
+ 	vpxor 14 * 16(%rax), %xmm15, %xmm14;
+ 	vpxor 15 * 16(%rax), %xmm15, %xmm15;
+ 
+-	pax_indirect_call "%r9", camellia_xts_enc_16way;
++	CALL_NOSPEC %r9;
+ 
+ 	addq $(16 * 16), %rsp;
+ 
+diff -Nurp a/arch/x86/crypto/crc32c-pcl-intel-asm_64.S b/arch/x86/crypto/crc32c-pcl-intel-asm_64.S
+--- a/arch/x86/crypto/crc32c-pcl-intel-asm_64.S	2018-06-03 23:05:45.841553219 +0200
++++ b/arch/x86/crypto/crc32c-pcl-intel-asm_64.S	2018-06-03 22:57:39.487965161 +0200
+@@ -46,6 +46,7 @@
+ #include <asm/inst.h>
+ #include <linux/linkage.h>
+ #include <asm/alternative-asm.h>
++#include <asm/nospec-branch.h>
+ 
+ ## ISCSI CRC 32 Implementation with crc32 and pclmulqdq Instruction
+ 
+@@ -173,7 +174,7 @@ continue_block:
+ 	movzxw  (bufp, %rax, 2), len
+ 	lea	crc_array(%rip), bufp
+ 	lea     (bufp, len, 1), bufp
+-	jmp     *bufp
++	JMP_NOSPEC bufp
+ 
+ 	################################################################
+ 	## 2a) PROCESS FULL BLOCKS:
+diff -Nurp a/arch/x86/kernel/irq_32.c b/arch/x86/kernel/irq_32.c
+--- a/arch/x86/kernel/irq_32.c	2018-06-03 23:05:45.877553340 +0200
++++ b/arch/x86/kernel/irq_32.c	2018-06-03 23:03:32.341098574 +0200
+@@ -19,6 +19,7 @@
+ #include <linux/mm.h>
+ 
+ #include <asm/apic.h>
++#include <asm/nospec-branch.h>
+ 
+ #ifdef CONFIG_DEBUG_STACKOVERFLOW
+ 
+@@ -57,17 +58,17 @@ DEFINE_PER_CPU(struct irq_stack *, softi
+ static void call_on_stack(void (asmlinkage *func)(void), void *stack)
+ {
+ 	asm volatile("xchgl	%%ebx,%%esp	\n"
+-		     PAX_INDIRECT_CALL("*%%edi", "__do_softirq") "\n"
++		     CALL_NOSPEC
+ 		     "movl	%%ebx,%%esp	\n"
+ 		     : "=b" (stack)
+ 		     : "0" (stack),
+-		       "D"(func)
++		       [thunk_target] "D"(func)
+ 		     : "memory", "cc", "edx", "ecx", "eax");
+ }
+ 
+ static inline void *current_stack(void)
+ {
+-	return (void *)(current_stack_pointer() & ~(THREAD_SIZE - 1));
++	return (void *)(current_stack_pointer & ~(THREAD_SIZE - 1));
+ }
+ 
+ static inline int execute_on_irq_stack(int overflow, struct irq_desc *desc)
+@@ -90,7 +91,7 @@ static inline int execute_on_irq_stack(i
+ 
+ 	/* Save the next esp at the bottom of the stack */
+ 	prev_esp = (u32 *)irqstk;
+-	*prev_esp = current_stack_pointer();
++	*prev_esp = current_stack_pointer;
+ 
+ #ifdef CONFIG_PAX_MEMORY_UDEREF
+ 	__set_fs(MAKE_MM_SEG(0));
+@@ -100,11 +101,11 @@ static inline int execute_on_irq_stack(i
+ 		call_on_stack(print_stack_overflow, isp);
+ 
+ 	asm volatile("xchgl	%%ebx,%%esp	\n"
+-		     PAX_INDIRECT_CALL("*%%edi", "handle_bad_irq") "\n"
++		     CALL_NOSPEC
+ 		     "movl	%%ebx,%%esp	\n"
+ 		     : "=a" (arg1), "=b" (isp)
+ 		     :  "0" (desc),   "1" (isp),
+-			"D" (desc->handle_irq)
++			[thunk_target] "D" (desc->handle_irq)
+ 		     : "memory", "cc", "ecx");
+ 
+ #ifdef CONFIG_PAX_MEMORY_UDEREF
+@@ -138,7 +139,7 @@ void do_softirq_own_stack(void)
+ 
+ 	/* Push the previous esp onto the stack */
+ 	prev_esp = (u32 *)irqstk;
+-	*prev_esp = current_stack_pointer();
++	*prev_esp = current_stack_pointer;
+ 
+ #ifdef CONFIG_PAX_MEMORY_UDEREF
+ 	__set_fs(MAKE_MM_SEG(0));
+diff -Nurp a/arch/x86/kernel/mcount_64.S b/arch/x86/kernel/mcount_64.S
+--- a/arch/x86/kernel/mcount_64.S	2018-06-03 23:05:45.881553354 +0200
++++ b/arch/x86/kernel/mcount_64.S	2018-06-03 22:52:05.050942330 +0200
+@@ -9,6 +9,7 @@
+ #include <asm/ftrace.h>
+ #include <asm/export.h>
+ #include <asm/alternative-asm.h>
++#include <asm/nospec-branch.h>
+ 
+ 	.code64
+ 	.section .entry.text, "ax"
+@@ -289,8 +290,10 @@ trace:
+ 	 * function tracing is enabled.
+ 	 */
+ 	pax_force_fptr ftrace_trace_function
+-	pax_indirect_call "ftrace_trace_function", ftrace_stub
++	//Still need it? pax_indirect_call "ftrace_trace_function", ftrace_stub
+ 
++	movq ftrace_trace_function, %r8
++	CALL_NOSPEC %r8
+ 	restore_mcount_regs
+ 
+ 	jmp fgraph_trace
+@@ -335,6 +338,6 @@ GLOBAL(return_to_handler)
+ 	movq (%rsp), %rax
+ 	addq $24, %rsp
+ 	pax_force_fptr %rdi
+-	jmp *%rdi
++	JMP_NOSPEC %rdi
+ ENDPROC(return_to_handler)
+ #endif
