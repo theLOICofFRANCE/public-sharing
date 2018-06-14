@@ -1,0 +1,247 @@
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1357,7 +1357,7 @@
+ 
+ choice
+ 	prompt "High Memory Support"
+-	default HIGHMEM4G
++	default HIGHMEM64G
+ 	depends on X86_32
+ 
+ config NOHIGHMEM
+@@ -1398,6 +1398,7 @@
+ 
+ config HIGHMEM4G
+ 	bool "4GB"
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Select this if you have a 32-bit processor and between 1 and 4
+ 	  gigabytes of physical RAM.
+@@ -1991,7 +1991,7 @@
+ 
+ config KEXEC
+ 	bool "kexec system call"
+-	select KEXEC_CORE
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  kexec is a system call that implements the ability to shutdown your
+ 	  current kernel, and to start another kernel.  It is like a reboot
+@@ -2273,7 +2273,7 @@
+ config COMPAT_VDSO
+ 	def_bool n
+ 	prompt "Disable the 32-bit vDSO (needed for glibc 2.3.3)"
+-	depends on COMPAT_32
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Certain buggy versions of glibc will crash if they are
+ 	  presented with a 32-bit vDSO that is not mapped at the address
+@@ -2316,6 +2316,7 @@
+ 
+ 	config LEGACY_VSYSCALL_EMULATE
+ 		bool "Emulate"
++		depends on BROKEN_SECURITY
+ 		help
+ 		  The kernel traps and emulates calls into the fixed
+ 		  vsyscall address mapping. This makes the mapping
+@@ -2381,6 +2381,7 @@
+ 
+ config MODIFY_LDT_SYSCALL
+ 	bool "Enable the LDT (local descriptor table)"
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Linux can allow user programs to install a per-process x86
+ 	  Local Descriptor Table (LDT) using the modify_ldt(2) system
+@@ -2872,11 +2873,7 @@
+ 
+ config IA32_EMULATION
+ 	bool "IA32 Emulation"
+-	depends on X86_64
+-	select ARCH_WANT_OLD_COMPAT_IPC
+-	select BINFMT_ELF
+-	select COMPAT_BINFMT_ELF
+-	select COMPAT_OLD_SIGACTION
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Include code to run legacy 32-bit programs under a
+ 	  64-bit kernel. You should likely turn this on, unless you're
+@@ -2890,7 +2887,7 @@
+ 
+ config X86_X32
+ 	bool "x32 ABI for 64-bit mode"
+-	depends on X86_64
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Include code to run binaries for the x32 native 32-bit ABI
+ 	  for 64-bit processors.  An x32 process gets access to the
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -420,7 +420,7 @@
+ 
+ config ACPI_CUSTOM_METHOD
+ 	tristate "Allow ACPI methods to be inserted/replaced at run time"
+-	depends on DEBUG_FS
++	depends on BROKEN_SECURITY
+ 	default n
+ 	help
+ 	  This debug facility allows ACPI AML methods to be inserted and/or
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -41,6 +41,9 @@ menu "General setup"
+ config BROKEN
+ 	bool
+ 
++config BROKEN_SECURITY
++	bool
++
+ config BROKEN_ON_SMP
+ 	bool
+ 	depends on BROKEN || !SMP
+@@ -1532,6 +1532,7 @@
+ 
+ config COMPAT_BRK
+ 	bool "Disable heap randomization"
++	depends on BROKEN_SECURITY
+ 	help
+ 	  Randomizing heap placement makes heap exploits harder, but it
+ 	  also breaks ancient binaries (including anything libc5 based).
+@@ -1735,6 +1734,7 @@
+ menuconfig MODULES
+ 	bool "Enable loadable module support"
+ 	option modules
++	#depends on BROKEN_SECURITY
+ 	help
+ 	  Kernel modules are small pieces of compiled code which can
+ 	  be inserted in the running kernel, rather than being
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -9,6 +9,7 @@
+ 
+ config DEVMEM
+ 	bool "/dev/mem virtual device support"
++	depends on BROKEN_SECURITY
+ 	help
+ 	  Say Y here if you want to support the /dev/mem device.
+ 	  The /dev/mem device is used to access areas of physical
+@@ -18,7 +18,7 @@
+ config DEVKMEM
+ 	bool "/dev/kmem virtual device support"
+ 	# On arm64, VMALLOC_START < PAGE_OFFSET, which confuses kmem read/write
+-	depends on !ARM64
++	depends on BROKEN_SECURITY
+ 	help
+ 	  Say Y here if you want to support the /dev/kmem device. The
+ 	  /dev/kmem device is rarely used, but can be used for certain
+--- a/fs/proc/Kconfig
++++ b/fs/proc/Kconfig
+@@ -30,7 +30,7 @@
+ 
+ config PROC_KCORE
+ 	bool "/proc/kcore support" if !ARM
+-	depends on PROC_FS && MMU
++	depends on BROKEN_SECURITY
+ 	help
+ 	  Provides a virtual ELF core file of the live kernel.  This can
+ 	  be read with gdb and other ELF tools.  No modifications can be
+--- a/kernel/power/Kconfig
++++ b/kernel/power/Kconfig
+@@ -33,11 +33,7 @@
+ 
+ config HIBERNATION
+ 	bool "Hibernation (aka 'suspend to disk')"
+-	depends on SWAP && ARCH_HIBERNATION_POSSIBLE
+-	select HIBERNATE_CALLBACKS
+-	select LZO_COMPRESS
+-	select LZO_DECOMPRESS
+-	select CRC32
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Enable the suspend to disk (STD) functionality, which is usually
+ 	  called "hibernation" in user interfaces.  STD checkpoints the
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -421,7 +421,7 @@
+ 
+ config INET_DIAG
+ 	tristate "INET: socket monitoring interface"
+-	default y
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Support for INET (TCP, DCCP, etc) socket monitoring interface used by
+ 	  native Linux tools such as ss. ss is included in iproute2, currently
+--- a/fs/Kconfig.binfmt
++++ b/fs/Kconfig.binfmt
+@@ -157,6 +157,7 @@
+ 
+ config BINFMT_MISC
+ 	tristate "Kernel support for MISC binaries"
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  If you say Y here, it will be possible to plug wrapper-driven binary
+ 	  formats into the kernel. You will like this especially when you use
+--- a/drivers/tty/Kconfig
++++ b/drivers/tty/Kconfig
+@@ -122,6 +122,7 @@
+ 
+ config LEGACY_PTYS
+ 	bool "Legacy (BSD) PTY support"
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  A pseudo terminal (PTY) is a software device consisting of two
+ 	  halves: a master and a slave. The slave device behaves identical to
+--- a/security/selinux/Kconfig
++++ b/security/selinux/Kconfig
+@@ -39,9 +39,7 @@
+ 
+ config SECURITY_SELINUX_DISABLE
+ 	bool "NSA SELinux runtime disable"
+-	depends on SECURITY_SELINUX
+-	select SECURITY_WRITABLE_HOOKS
+-	default n
++	depends on BROKEN_SECURITY
+ 	help
+ 	  This option enables writing to a selinuxfs node 'disable', which
+ 	  allows SELinux to be disabled at runtime prior to the policy load.
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -179,7 +211,7 @@
+ 
+ config HARDENED_USERCOPY_FALLBACK
+ 	bool "Allow usercopy whitelist violations to fallback to object size"
+-	depends on HARDENED_USERCOPY
++	depends on BROKEN_SECURITY
+ 	help
+ 	  This is a temporary option that allows missing usercopy whitelists
+ 	  to be discovered via a WARN() to the kernel log, instead of
+--- a/arch/x86/Kconfig.cpu
++++ b/arch/x86/Kconfig.cpu
+@@ -52,7 +52,7 @@
+ 
+ config M486
+ 	bool "486"
+-	depends on X86_32
++	depends on BROKEN_SECURITY
+ 	---help---
+ 	  Select this for an 486-class CPU such as AMD/Cyrix/IBM/Intel
+ 	  486DX/DX2/DX4 or SL/SLC/SLC2/SLC3/SX/SX2 and UMC U5D or U5S.
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -1602,7 +1602,7 @@
+ 
+ config OABI_COMPAT
+ 	bool "Allow old ABI binaries to run with this kernel (EXPERIMENTAL)"
+-	depends on AEABI && !THUMB2_KERNEL
++	depends on BROKEN_SECURITY
+ 	help
+ 	  This option preserves the old syscall interface along with the
+ 	  new (ARM EABI) one. It also provides a compatibility layer to
+--- a/fs/Kconfig.binfmt
++++ b/fs/Kconfig.binfmt
+@@ -112,7 +112,7 @@ config HAVE_AOUT
+ 
+ config BINFMT_AOUT
+ 	tristate "Kernel support for a.out and ECOFF binaries"
+-	depends on HAVE_AOUT
++	depends on HAVE_AOUT && BROKEN_SECURITY
+ 	---help---
+ 	  A.out (Assembler.OUTput) is a set of formats for libraries and
+ 	  executables used in the earliest versions of UNIX.  Linux used
