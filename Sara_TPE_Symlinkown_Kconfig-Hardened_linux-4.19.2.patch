@@ -1,0 +1,5413 @@
+diff -Nurp a/arch/Kconfig b/arch/Kconfig
+--- a/arch/Kconfig	2018-11-13 20:09:00.000000000 +0100
++++ b/arch/Kconfig	2018-11-20 10:51:05.263825257 +0100
+@@ -244,6 +244,12 @@ config ARCH_HAS_FORTIFY_SOURCE
+ 	  An architecture should select this when it can successfully
+ 	  build and run with CONFIG_FORTIFY_SOURCE.
+ 
++config ARCH_HAS_LSM_PAGEFAULT
++	bool
++	help
++	  An architecture should select this if it supports
++	  "pagefault_handler" LSM hook.
++
+ # Select if arch has all set_memory_ro/rw/x/nx() functions in asm/cacheflush.h
+ config ARCH_HAS_SET_MEMORY
+ 	bool
+diff -Nurp a/arch/x86/Kbuild b/arch/x86/Kbuild
+--- a/arch/x86/Kbuild	2018-11-13 20:09:00.000000000 +0100
++++ b/arch/x86/Kbuild	2018-11-20 10:51:05.263825257 +0100
+@@ -22,3 +22,5 @@ obj-y += platform/
+ obj-y += net/
+ 
+ obj-$(CONFIG_KEXEC_FILE) += purgatory/
++
++obj-y += security/
+diff -Nurp a/arch/x86/Kconfig b/arch/x86/Kconfig
+--- a/arch/x86/Kconfig	2018-11-13 20:09:00.000000000 +0100
++++ b/arch/x86/Kconfig	2018-11-20 10:51:05.267825272 +0100
+@@ -58,6 +58,7 @@ config X86
+ 	select ARCH_HAS_FORTIFY_SOURCE
+ 	select ARCH_HAS_GCOV_PROFILE_ALL
+ 	select ARCH_HAS_KCOV			if X86_64
++	select ARCH_HAS_LSM_PAGEFAULT
+ 	select ARCH_HAS_MEMBARRIER_SYNC_CORE
+ 	select ARCH_HAS_PMEM_API		if X86_64
+ 	select ARCH_HAS_PTE_SPECIAL
+diff -Nurp a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+--- a/arch/x86/mm/fault.c	2018-11-13 20:09:00.000000000 +0100
++++ b/arch/x86/mm/fault.c	2018-11-20 10:52:17.768097560 +0100
+@@ -16,6 +16,7 @@
+ #include <linux/prefetch.h>		/* prefetchw			*/
+ #include <linux/context_tracking.h>	/* exception_enter(), ...	*/
+ #include <linux/uaccess.h>		/* faulthandler_disabled()	*/
++#include <linux/security.h>		/* security_pagefault_handler	*/
+ #include <linux/mm_types.h>
+ 
+ #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
+@@ -1298,6 +1299,11 @@ __do_page_fault(struct pt_regs *regs, un
+ 			local_irq_enable();
+ 	}
+ 
++	if (unlikely(security_pagefault_handler(regs,
++						error_code,
++						address)))
++		return;
++
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
+ 
+ 	if (error_code & X86_PF_WRITE)
+diff -Nurp a/arch/x86/security/Makefile b/arch/x86/security/Makefile
+--- a/arch/x86/security/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/security/Makefile	2018-11-20 10:51:05.267825272 +0100
+@@ -0,0 +1,2 @@
++subdir-$(CONFIG_SECURITY_SARA)		+= sara
++obj-$(CONFIG_SECURITY_SARA)		+= sara/
+diff -Nurp a/arch/x86/security/sara/emutramp.c b/arch/x86/security/sara/emutramp.c
+--- a/arch/x86/security/sara/emutramp.c	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/security/sara/emutramp.c	2018-11-20 10:51:05.267825272 +0100
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * Assembly sequences used here were copied from
++ * PaX patch by PaX Team <pageexec@freemail.hu>
++ * Being just hexadecimal constants, they are not subject to
++ * any copyright.
++ *
++ */
++
++#define PF_PROT		(1 << 0)
++#define PF_USER		(1 << 2)
++#define PF_INSTR	(1 << 4)
++
++#ifdef CONFIG_X86_32
++
++#include "trampolines32.h"
++static inline int trampoline_emulator(struct pt_regs *regs,
++				      unsigned long address)
++{
++	return sara_trampoline_emulator_x86_32(regs);
++}
++
++#else /* CONFIG_X86_32 */
++
++#include "trampolines64.h"
++static inline int trampoline_emulator(struct pt_regs *regs,
++				      unsigned long address)
++{
++	return sara_trampoline_emulator_x86_64(regs, address);
++}
++
++#endif /* CONFIG_X86_32 */
++
++
++int sara_trampoline_emulator(struct pt_regs *regs,
++			     unsigned long error_code,
++			     unsigned long address)
++{
++	if (!(error_code & PF_USER) ||
++	    !(error_code & PF_INSTR) ||
++	    !(error_code & PF_PROT))
++		return 0;
++
++	local_irq_enable();
++	might_sleep();
++	might_fault();
++	return trampoline_emulator(regs, address);
++}
+diff -Nurp a/arch/x86/security/sara/Makefile b/arch/x86/security/sara/Makefile
+--- a/arch/x86/security/sara/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/security/sara/Makefile	2018-11-20 10:51:05.267825272 +0100
+@@ -0,0 +1 @@
++obj-$(CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP) := emutramp.o
+diff -Nurp a/arch/x86/security/sara/trampolines32.h b/arch/x86/security/sara/trampolines32.h
+--- a/arch/x86/security/sara/trampolines32.h	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/security/sara/trampolines32.h	2018-11-20 10:51:05.267825272 +0100
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * Assembly sequences used here were copied from
++ * PaX patch by PaX Team <pageexec@freemail.hu>
++ * Being just hexadecimal constants, they are not subject to
++ * any copyright.
++ *
++ */
++
++#ifndef __TRAMPOLINES32_H
++#define __TRAMPOLINES32_H
++
++#include <linux/printk.h>
++#include <linux/uaccess.h>
++
++struct libffi_trampoline_x86_32 {
++	unsigned char mov;
++	unsigned int addr1;
++	unsigned char jmp;
++	unsigned int addr2;
++} __packed;
++
++struct gcc_trampoline_x86_32_type1 {
++	unsigned char mov1;
++	unsigned int addr1;
++	unsigned char mov2;
++	unsigned int addr2;
++	unsigned short jmp;
++} __packed;
++
++struct gcc_trampoline_x86_32_type2 {
++	unsigned char mov;
++	unsigned int addr1;
++	unsigned char jmp;
++	unsigned int addr2;
++} __packed;
++
++union trampolines_x86_32 {
++	struct libffi_trampoline_x86_32 lf;
++	struct gcc_trampoline_x86_32_type1 g1;
++	struct gcc_trampoline_x86_32_type2 g2;
++};
++
++#define is_valid_libffi_trampoline_x86_32(UNION)	\
++	(UNION.lf.mov == 0xB8 &&			\
++	UNION.lf.jmp == 0xE9)
++
++#define emulate_libffi_trampoline_x86_32(UNION, REGS) do {	\
++	(REGS)->ax = UNION.lf.addr1;				\
++	(REGS)->ip = (unsigned int) ((REGS)->ip +		\
++				     UNION.lf.addr2 +		\
++				     sizeof(UNION.lf));		\
++} while (0)
++
++#define is_valid_gcc_trampoline_x86_32_type1(UNION, REGS)	\
++	(UNION.g1.mov1 == 0xB9 &&				\
++	UNION.g1.mov2 == 0xB8 &&				\
++	UNION.g1.jmp == 0xE0FF &&				\
++	REGS->ip > REGS->sp)
++
++#define emulate_gcc_trampoline_x86_32_type1(UNION, REGS) do {	\
++	(REGS)->cx = UNION.g1.addr1;				\
++	(REGS)->ax = UNION.g1.addr2;				\
++	(REGS)->ip = UNION.g1.addr2;				\
++} while (0)
++
++#define is_valid_gcc_trampoline_x86_32_type2(UNION, REGS)	\
++	(UNION.g2.mov == 0xB9 &&				\
++	UNION.g2.jmp == 0xE9 &&					\
++	REGS->ip > REGS->sp)
++
++#define emulate_gcc_trampoline_x86_32_type2(UNION, REGS) do {	\
++	(REGS)->cx = UNION.g2.addr1;				\
++	(REGS)->ip = (unsigned int) ((REGS)->ip +		\
++				     UNION.g2.addr2 +		\
++				     sizeof(UNION.g2));		\
++} while (0)
++
++static inline int sara_trampoline_emulator_x86_32(struct pt_regs *regs)
++{
++	int ret;
++	void __user *ip = (void __user *) regs->ip;
++	union trampolines_x86_32 t;
++
++	BUILD_BUG_ON(sizeof(t.lf) > sizeof(t.g1));
++	BUILD_BUG_ON(sizeof(t.g2) > sizeof(t.lf));
++
++	ret = copy_from_user(&t, ip, sizeof(t.g1));
++	if (ret)
++		ret = copy_from_user(&t, ip, sizeof(t.lf));
++	if (ret)
++		ret = copy_from_user(&t, ip, sizeof(t.g2));
++	if (ret)
++		return 0;
++
++	if (is_valid_gcc_trampoline_x86_32_type1(t, regs)) {
++		pr_debug("Trampoline: gcc1 x86_32.\n");
++		emulate_gcc_trampoline_x86_32_type1(t, regs);
++		return 1;
++	} else if (is_valid_libffi_trampoline_x86_32(t)) {
++		pr_debug("Trampoline: libffi x86_32.\n");
++		emulate_libffi_trampoline_x86_32(t, regs);
++		return 1;
++	} else if (is_valid_gcc_trampoline_x86_32_type2(t, regs)) {
++		pr_debug("Trampoline: gcc2 x86_32.\n");
++		emulate_gcc_trampoline_x86_32_type2(t, regs);
++		return 1;
++	}
++
++	pr_debug("Not a trampoline (x86_32).\n");
++
++	return 0;
++}
++
++#endif /* __TRAMPOLINES32_H */
+diff -Nurp a/arch/x86/security/sara/trampolines64.h b/arch/x86/security/sara/trampolines64.h
+--- a/arch/x86/security/sara/trampolines64.h	1970-01-01 01:00:00.000000000 +0100
++++ b/arch/x86/security/sara/trampolines64.h	2018-11-20 10:51:05.267825272 +0100
+@@ -0,0 +1,150 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * Assembly sequences used here were copied from
++ * PaX patch by PaX Team <pageexec@freemail.hu>
++ * Being just hexadecimal constants, they are not subject to
++ * any copyright.
++ *
++ */
++
++#ifndef __TRAMPOLINES64_H
++#define __TRAMPOLINES64_H
++
++#include <linux/printk.h>
++#include <linux/uaccess.h>
++
++#include "trampolines32.h"
++
++struct libffi_trampoline_x86_64 {
++	unsigned short mov1;
++	unsigned long addr1;
++	unsigned short mov2;
++	unsigned long addr2;
++	unsigned char stcclc;
++	unsigned short jmp1;
++	unsigned char jmp2;
++} __packed;
++
++struct gcc_trampoline_x86_64_type1 {
++	unsigned short mov1;
++	unsigned long addr1;
++	unsigned short mov2;
++	unsigned long addr2;
++	unsigned short jmp1;
++	unsigned char jmp2;
++} __packed;
++
++struct gcc_trampoline_x86_64_type2 {
++	unsigned short mov1;
++	unsigned int addr1;
++	unsigned short mov2;
++	unsigned long addr2;
++	unsigned short jmp1;
++	unsigned char jmp2;
++} __packed;
++
++union trampolines_x86_64 {
++	struct libffi_trampoline_x86_64 lf;
++	struct gcc_trampoline_x86_64_type1 g1;
++	struct gcc_trampoline_x86_64_type2 g2;
++};
++
++#define is_valid_libffi_trampoline_x86_64(UNION)	\
++	(UNION.lf.mov1 == 0xBB49 &&			\
++	UNION.lf.mov2 == 0xBA49 &&			\
++	(UNION.lf.stcclc == 0xF8 ||			\
++	 UNION.lf.stcclc == 0xF9) &&			\
++	UNION.lf.jmp1 == 0xFF49 &&			\
++	UNION.lf.jmp2 == 0xE3)
++
++#define emulate_libffi_trampoline_x86_64(UNION, REGS) do {	\
++	(REGS)->r11 = UNION.lf.addr1;				\
++	(REGS)->r10 = UNION.lf.addr2;				\
++	(REGS)->ip = UNION.lf.addr1;				\
++	if (UNION.lf.stcclc == 0xF8)				\
++		(REGS)->flags &= ~X86_EFLAGS_CF;		\
++	else							\
++		(REGS)->flags |= X86_EFLAGS_CF;			\
++} while (0)
++
++#define is_valid_gcc_trampoline_x86_64_type1(UNION, REGS)	\
++	(UNION.g1.mov1 == 0xBB49 &&				\
++	UNION.g1.mov2 == 0xBA49 &&				\
++	UNION.g1.jmp1 == 0xFF49 &&				\
++	UNION.g1.jmp2 == 0xE3 &&				\
++	REGS->ip > REGS->sp)
++
++#define emulate_gcc_trampoline_x86_64_type1(UNION, REGS) do {	\
++	(REGS)->r11 = UNION.g1.addr1;				\
++	(REGS)->r10 = UNION.g1.addr2;				\
++	(REGS)->ip = UNION.g1.addr1;				\
++} while (0)
++
++#define is_valid_gcc_trampoline_x86_64_type2(UNION, REGS)	\
++	(UNION.g2.mov1 == 0xBB41 &&				\
++	UNION.g2.mov2 == 0xBA49 &&				\
++	UNION.g2.jmp1 == 0xFF49 &&				\
++	UNION.g2.jmp2 == 0xE3 &&				\
++	REGS->ip > REGS->sp)
++
++#define emulate_gcc_trampoline_x86_64_type2(UNION, REGS) do {	\
++	(REGS)->r11 = UNION.g2.addr1;				\
++	(REGS)->r10 = UNION.g2.addr2;				\
++	(REGS)->ip = UNION.g2.addr1;				\
++} while (0)
++
++static inline int sara_trampoline_emulator_x86_64(struct pt_regs *regs,
++						  unsigned long address)
++{
++	int ret;
++	void __user *ip = (void __user *) regs->ip;
++	union trampolines_x86_64 t;
++
++	BUILD_BUG_ON(sizeof(t.g1) > sizeof(t.lf));
++	BUILD_BUG_ON(sizeof(t.g2) > sizeof(t.g1));
++
++	if (regs->cs == __USER32_CS ||
++	    regs->cs & (1<<2)) {
++		if (address >> 32)	/* K8 erratum #100 */
++			return 0;
++		return sara_trampoline_emulator_x86_32(regs);
++	}
++
++	ret = copy_from_user(&t, ip, sizeof(t.lf));
++	if (ret)
++		ret = copy_from_user(&t, ip, sizeof(t.g1));
++	if (ret)
++		ret = copy_from_user(&t, ip, sizeof(t.g2));
++	if (ret)
++		return 0;
++
++	if (is_valid_libffi_trampoline_x86_64(t)) {
++		pr_debug("Trampoline: libffi x86_64.\n");
++		emulate_libffi_trampoline_x86_64(t, regs);
++		return 1;
++	} else if (is_valid_gcc_trampoline_x86_64_type1(t, regs)) {
++		pr_debug("Trampoline: gcc1 x86_64.\n");
++		emulate_gcc_trampoline_x86_64_type1(t, regs);
++		return 1;
++	} else if (is_valid_gcc_trampoline_x86_64_type2(t, regs)) {
++		pr_debug("Trampoline: gcc2 x86_64.\n");
++		emulate_gcc_trampoline_x86_64_type2(t, regs);
++		return 1;
++	}
++
++	pr_debug("Not a trampoline (x86_64).\n");
++
++	return 0;
++
++}
++
++#endif /* __TRAMPOLINES64_H */
+diff -Nurp a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+--- a/Documentation/admin-guide/kernel-parameters.txt	2018-11-13 20:09:00.000000000 +0100
++++ b/Documentation/admin-guide/kernel-parameters.txt	2018-11-20 10:51:05.287825350 +0100
+@@ -4055,6 +4055,46 @@
+ 			1 -- enable.
+ 			Default value is set via kernel config option.
+ 
++	sara.enabled=	[SARA] Disable or enable S.A.R.A. at boot time.
++			If disabled this way S.A.R.A. can't be enabled
++			again.
++			Format: { "0" | "1" }
++			See security/sara/Kconfig help text
++			0 -- disable.
++			1 -- enable.
++			Default value is set via kernel config option.
++
++	sara.wxprot_enabled= [SARA]
++			Disable or enable S.A.R.A. WX Protection
++			at boot time.
++			Format: { "0" | "1" }
++			See security/sara/Kconfig help text
++			0 -- disable.
++			1 -- enable.
++			Default value is set via kernel config option.
++
++	sara.wxprot_default_flags= [SARA]
++			Set S.A.R.A. WX Protection default flags.
++			Format: <integer>
++			See S.A.R.A. documentation.
++			Default value is set via kernel config option.
++
++	sara.wxprot_xattrs_enabled= [SARA]
++			Enable support for security xattrs.
++			Format: { "0" | "1" }
++			See security/sara/Kconfig help text
++			0 -- disable.
++			1 -- enable.
++			Default value is set via kernel config option.
++
++	sara.wxprot_xattrs_user= [SARA]
++			Enable support for user xattrs.
++			Format: { "0" | "1" }
++			See security/sara/Kconfig help text
++			0 -- disable.
++			1 -- enable.
++			Default value is set via kernel config option.
++
+ 	serialnumber	[BUGS=X86-32]
+ 
+ 	shapers=	[NET]
+diff -Nurp a/Documentation/admin-guide/LSM/index.rst b/Documentation/admin-guide/LSM/index.rst
+--- a/Documentation/admin-guide/LSM/index.rst	2018-11-13 20:09:00.000000000 +0100
++++ b/Documentation/admin-guide/LSM/index.rst	2018-11-20 10:51:05.299825396 +0100
+@@ -39,3 +39,4 @@ the one "major" module (e.g. SELinux) if
+    Smack
+    tomoyo
+    Yama
++   SARA
+diff -Nurp a/Documentation/admin-guide/LSM/SARA.rst b/Documentation/admin-guide/LSM/SARA.rst
+--- a/Documentation/admin-guide/LSM/SARA.rst	1970-01-01 01:00:00.000000000 +0100
++++ b/Documentation/admin-guide/LSM/SARA.rst	2018-11-20 10:51:05.299825396 +0100
+@@ -0,0 +1,197 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++========
++S.A.R.A.
++========
++
++S.A.R.A. (S.A.R.A. is Another Recursive Acronym) is a stacked Linux Security
++Module that aims to collect heterogeneous security measures, providing a common
++interface to manage them.
++As of today it consists of one submodule:
++
++- WX Protection
++
++
++The kernel-space part is complemented by its user-space counterpart: `saractl`
++[2]_.
++A test suite for WX Protection, called `sara-test` [4]_, is also available.
++More information about where to find these tools and the full S.A.R.A.
++documentation are in the `External Links and Documentation`_ section.
++
++-------------------------------------------------------------------------------
++
++S.A.R.A.'s Submodules
++=====================
++
++WX Protection
++-------------
++WX Protection aims to improve user-space programs security by applying:
++
++- `W^X enforcement`_
++- `W!->X (once writable never executable) mprotect restriction`_
++- `Executable MMAP prevention`_
++
++All of the above features can be enabled or disabled both system wide
++or on a per executable basis through the use of configuration files managed by
++`saractl` [2]_.
++
++It is important to note that some programs may have issues working with
++WX Protection. In particular:
++
++- **W^X enforcement** will cause problems to any programs that needs
++  memory pages mapped both as writable and executable at the same time e.g.
++  programs with executable stack markings in the *PT_GNU_STACK* segment.
++- **W!->X mprotect restriction** will cause problems to any program that
++  needs to generate executable code at run time or to modify executable
++  pages e.g. programs with a *JIT* compiler built-in or linked against a
++  *non-PIC* library.
++- **Executable MMAP prevention** can work only with programs that have at least
++  partial *RELRO* support. It's disabled automatically for programs that
++  lack this feature. It will cause problems to any program that uses *dlopen*
++  or tries to do an executable mmap. Unfortunately this feature is the one
++  that could create most problems and should be enabled only after careful
++  evaluation.
++
++To extend the scope of the above features, despite the issues that they may
++cause, they are complemented by **/proc/PID/attr/sara/wxprot** interface
++and **trampoline emulation**.
++It's also possible to override the centralized configuration via `Extended
++filesystem attributes`_.
++
++At the moment, WX Protection (unless specified otherwise) should work on
++any architecture supporting the NX bit, including, but not limited to:
++`x86_64`, `x86_32` (with PAE), `ARM` and `ARM64`.
++
++Parts of WX Protection are inspired by some of the features available in PaX.
++
++For further information about configuration file format and user-space
++utilities please take a look at the full documentation [1]_.
++
++W^X enforcement
++^^^^^^^^^^^^^^^
++W^X means that a program can't have a page of memory that is marked, at the
++same time, writable and executable. This also allow to detect many bad
++behaviours that make life much more easy for attackers. Programs running with
++this feature enabled will be more difficult to exploit in the case they are
++affected by some vulnerabilities, because the attacker will be forced
++to make more steps in order to exploit them.
++This feature also blocks accesses to /proc/*/mem files that would allow to
++write the current process read-only memory, bypassing any protection.
++
++W!->X (once writable never executable) mprotect restriction
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++"Once writable never executable" means that any page that could have been
++marked as writable in the past won't ever be allowed to be marked (e.g. via
++an mprotect syscall) as executable.
++This goes on the same track as W^X, but is much stricter and prevents
++the runtime creation of new executable code in memory.
++Obviously, this feature does not prevent a program from creating a new file and
++*mmapping* it as executable, however, it will be way more difficult for
++attackers to exploit vulnerabilities if this feature is enabled.
++
++Executable MMAP prevention
++^^^^^^^^^^^^^^^^^^^^^^^^^^
++This feature prevents the creation of new executable mmaps after the dynamic
++libraries have been loaded. When used in combination with **W!->X mprotect
++restriction** this feature will completely prevent the creation of new
++executable code from the current thread.
++Obviously, this feature does not prevent cases in which an attacker uses an
++*execve* to start a completely new program. This kind of restriction, if
++needed, can be applied using one of the other LSM that focuses on MAC.
++Please be aware that this feature can break many programs and so it should be
++enabled after careful evaluation.
++
++/proc/PID/attr/sara/wxprot interface
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++The `procattr` interface can be used by a thread to discover which
++WX Protection features are enabled and/or to tighten them: protection
++can't be softened via procattr.
++The interface is simple: it's a text file with an hexadecimal
++number in it representing enabled features (more information can be
++found in the `Flags values`_ section). Via this interface it is also
++possible to perform a complete memory scan to remove the write permission
++from pages that are both writable and executable, please note that this
++change will also affect other threads of the same process.
++
++Protections that prevent the runtime creation of executable code
++can be troublesome for all those programs that actually need to do it
++e.g. programs shipping with a JIT compiler built-in.
++This feature can be use to run the JIT compiler with few restrictions
++while enforcing full WX Protection in the rest of the program.
++
++The preferred way to access this interface is via `libsara` [3]_.
++If you don't want it as a dependency, you can just statically link it
++in your project or copy/paste parts of it.
++To make things simpler `libsara` is the only part of S.A.R.A. released under
++*CC0 - No Rights Reserved* license.
++
++Extended filesystem attributes
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++When this functionality is enabled, it's possible to override
++WX Protection flags set in the main configuration via extended attributes,
++even when S.A.R.A.'s configuration is in "locked" mode.
++If the user namespace is also enabled, its attributes will override settings
++configured via the security namespace.
++The xattrs currently in use are:
++
++- security.sara.wxprot
++- user.sara.wxprot
++
++They can be manually set to the desired value as a decimal, hexadecimal or
++octal number. When this functionality is enabled, S.A.R.A. can be easily used
++without the help of its userspace tools. Though the preferred way to change
++these attributes is `sara-xattr` which is part of `saractl` [2]_.
++
++
++Trampoline emulation
++^^^^^^^^^^^^^^^^^^^^
++Some programs need to generate part of their code at runtime. Luckily enough,
++in some cases they only generate well-known code sequences (the
++*trampolines*) that can be easily recognized and emulated by the kernel.
++This way WX Protection can still be active, so a potential attacker won't be
++able to generate arbitrary sequences of code, but just those that are
++explicitly allowed. This is not ideal, but it's still better than having WX
++Protection completely disabled.
++
++In particular S.A.R.A. is able to recognize trampolines used by GCC for nested
++C functions and libffi's trampolines.
++This feature is available only on `x86_32` and `x86_64`.
++
++Flags values
++^^^^^^^^^^^^
++Flags are represented as a 16 bit unsigned integer in which every bit indicates
++the status of a given feature:
++
+++------------------------------+----------+
++|           Feature            |  Value   |
+++==============================+==========+
++| W!->X Heap                   |  0x0001  |
+++------------------------------+----------+
++| W!->X Stack                  |  0x0002  |
+++------------------------------+----------+
++| W!->X Other memory           |  0x0004  |
+++------------------------------+----------+
++| W^X                          |  0x0008  |
+++------------------------------+----------+
++| Don't enforce, just complain |  0x0010  |
+++------------------------------+----------+
++| Be Verbose                   |  0x0020  |
+++------------------------------+----------+
++| Executable MMAP prevention   |  0x0040  |
+++------------------------------+----------+
++| Force W^X on setprocattr     |  0x0080  |
+++------------------------------+----------+
++| Trampoline emulation         |  0x0100  |
+++------------------------------+----------+
++| Children will inherit flags  |  0x0200  |
+++------------------------------+----------+
++
++-------------------------------------------------------------------------------
++
++External Links and Documentation
++================================
++
++.. [1] `Documentation	<https://sara.smeso.it>`_
++.. [2] `saractl		<https://github.com/smeso/saractl>`_
++.. [3] `libsara		<https://github.com/smeso/libsara>`_
++.. [4] `sara-test	<https://github.com/smeso/sara-test>`_
+diff -Nurp a/Documentation/security/hardenedconfig.rst b/Documentation/security/hardenedconfig.rst
+--- a/Documentation/security/hardenedconfig.rst	1970-01-01 01:00:00.000000000 +0100
++++ b/Documentation/security/hardenedconfig.rst	2018-11-20 10:51:05.303825411 +0100
+@@ -0,0 +1,971 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++===============================
++Hardening Configuration Options
++===============================
++
++This is a list of configuration options that are useful for hardening purposes.
++These options are divided in 4 levels based on the magnitude of their negative
++side effects, not on their importance or usefulness:
++
++	- **Low**: Negligible performance impact. No user-space breakage.
++	- **Medium**: Some performance impact and/or user-space breakage for
++	  few users.
++	- **High**: Notable performance impact and/or user-space breakage for
++	  many users.
++	- **Extreme**: Big performance impact and/or user-space breakage for
++	  most users.
++
++In other words: **Low** level contains protections that *everybody* can and
++should use; **Medium** level should be usable by *most people* without issues;
++**High** level may cause *some trouble*, especially from a *performance*
++perspective; **Extreme** level contains protections that *few people* may want
++to enable, some people will probably *cherry-pick* some options from here based
++on their needs.
++
++For further details about which option is included in each level, please read
++the description below, for more information on any particular option refer to
++their help page.
++
++The content of this list is automatically translated into *config fragments*
++that can be used to apply the suggested hardening options to your current
++configuration.
++To use them you just need to run ``make hardened$LEVELconfig`` (e.g.
++``make hardenedhighconfig``).
++
++
++
++CONFIG_ACPI_CUSTOM_METHOD=n
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Kernel memory integrity
++
++This debug facility allows ACPI AML methods to be inserted and/or replaced
++without rebooting the system.
++This option is security sensitive, because it allows arbitrary kernel
++memory to be written to by root (uid=0) users, allowing them to bypass
++certain security measures (e.g. if root is not allowed to load additional
++kernel modules after boot, this feature may be used to override that
++restriction).
++
++
++CONFIG_BPF_JIT=n
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Kernel attack surface reduction
++
++Berkeley Packet Filter filtering capabilities are normally handled
++by an interpreter. This option allows kernel to generate a native
++code when filter is loaded in memory. This should significantly
++speedup packet sniffing (libpcap/tcpdump) and seccomp.
++
++Note, admin should enable this feature changing:
++/proc/sys/net/core/bpf_jit_enable
++/proc/sys/net/core/bpf_jit_harden   (optional)
++/proc/sys/net/core/bpf_jit_kallsyms (optional)
++
++
++CONFIG_BPF_SYSCALL=n
++~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Kernel attack surface reduction
++
++Enable the bpf() system call that allows to manipulate eBPF
++programs and maps via file descriptors.
++
++
++CONFIG_BUG_ON_DATA_CORRUPTION=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Self-protection
++
++Select this option if the kernel should BUG when it encounters
++data corruption in kernel memory structures when they get checked
++for validity.
++
++
++CONFIG_CC_STACKPROTECTOR=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Kernel memory integrity
++
++Turns on the "stack-protector" GCC feature. This feature puts,
++at the beginning of functions, a canary value on
++the stack just before the return address, and validates
++the value just before actually returning.  Stack based buffer
++overflows (that need to overwrite this return address) now also
++overwrite the canary, which gets detected and the attack is then
++neutralized via a kernel panic.
++
++
++CONFIG_CC_STACKPROTECTOR_STRONG=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Kernel memory integrity
++
++Functions will have the stack-protector canary logic added in any
++of the following conditions:
++
++- local variable's address used as part of the right hand side of an
++assignment or function argument
++- local variable is an array (or union containing an array),
++regardless of array type or length
++- uses register local variables
++
++This feature requires gcc version 4.9 or above, or a distribution
++gcc with the feature backported ("-fstack-protector-strong").
++
++On an x86 "defconfig" build, this feature adds canary checks to
++about 20% of all kernel functions, which increases the kernel code
++size by about 2%.
++
++
++CONFIG_COMPAT_BRK=n
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Userspace brk ASLR
++
++Randomizing heap placement makes heap exploits harder, but it
++also breaks ancient binaries (including anything libc5 based).
++This option changes the bootup default to heap randomization
++disabled, and can be overridden at runtime by setting
++/proc/sys/kernel/randomize_va_space to 2.
++
++On non-ancient distros (post-2000 ones) N is usually a safe choice.
++
++
++CONFIG_COMPAT_VDSO=n
++~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** User space protection
++
++
++Map the VDSO to the predictable old-style address too.
++Glibc 2.3.3 is the only version that needs it, but
++OpenSUSE 9 contains a buggy "glibc 2.3.2".
++
++
++CONFIG_DEBUG_CREDENTIALS=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Turn on some debug checking for credential management.
++These structs are often abused by attackers.
++
++
++CONFIG_DEBUG_LIST=y
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Turn on extended checks in the linked-list walking routines.
++These structs are often abused by attackers.
++
++
++CONFIG_DEBUG_NOTIFIERS=y
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Turn on sanity checking for notifier call chains.
++These structs are often abused by attackers.
++
++
++CONFIG_DEBUG_SG=y
++~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Turn on checks on scatter-gather tables.
++These structs could be abused by attackers.
++
++
++CONFIG_DEBUG_WX=y
++~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Generate a warning if any W+X mappings are found at boot.
++This is useful for discovering cases where the kernel is leaving W+X
++mappings after applying NX, as such mappings are a security risk.
++There is no runtime or memory usage effect of this option once the
++kernel has booted up - it's a one time check.
++
++
++CONFIG_DEVKMEM=n
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++The /dev/kmem device can be used by root to access kernel virtual memory.
++It is rarely used, but can be used for certain kind of kernel debugging
++operations.
++
++
++CONFIG_DEVMEM=n
++~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++The /dev/mem device is used to access areas of physical
++memory.
++
++
++CONFIG_STRICT_DEVMEM=y
++~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++If this option is disabled, you allow userspace (root) access
++to all of memory, including kernel and userspace memory.
++Accidental access to this is obviously disastrous, but specific
++access can be used by people debugging the kernel.
++If this option is switched on, the /dev/mem file only allows
++userspace access to memory mapped peripherals.
++
++
++CONFIG_IO_STRICT_DEVMEM=y
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++If this option is disabled, you allow userspace (root) access to
++all io-memory regardless of whether a driver is actively using that
++range. Accidental access to this is obviously disastrous, but
++specific access can be used by people debugging kernel drivers.
++If this option is switched on, the /dev/mem file only allows
++userspace access to *idle* io-memory ranges (see /proc/iomem)
++This may break traditional users of /dev/mem (dosemu, legacy X, etc...)
++if the driver using a given range cannot be disabled.
++
++
++CONFIG_FORTIFY_SOURCE=y
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Detect overflows of buffers in common string and memory functions
++where the compiler can determine and validate the buffer sizes.
++
++
++CONFIG_FTRACE=n
++~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Kernel attack surface reduction
++
++Enable the kernel tracing infrastructure.
++
++
++CONFIG_GCC_PLUGINS=y
++~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Prerequisite
++
++GCC plugins are loadable modules that provide extra features to the
++compiler. They are useful for runtime instrumentation and static analysis.
++
++See Documentation/gcc-plugins.txt for details.
++
++
++CONFIG_GCC_PLUGIN_LATENT_ENTROPY=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++With this pluging, the kernel will instrument some kernel code to
++extract some entropy from both original and artificially created
++program state. This will help especially embedded systems where
++there is little 'natural' source of entropy normally.  The cost
++is some slowdown of the boot process (about 0.5%) and fork and
++irq processing.
++Note that entropy extracted this way is not cryptographically
++secure!
++
++
++CONFIG_GCC_PLUGIN_RANDSTRUCT=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++With this pluging, the layouts of structures that are entirely
++function pointers (and have not been manually annotated with
++__no_randomize_layout), or structures that have been explicitly
++marked with __randomize_layout, will be randomized at compile-time.
++This can introduce the requirement of an additional information
++exposure vulnerability for exploits targeting these structure
++types.
++Enabling this feature will introduce some performance impact,
++slightly increase memory usage, and prevent the use of forensic
++tools like Volatility against the system (unless the kernel
++source tree isn't cleaned after kernel installation).
++
++
++CONFIG_GCC_PLUGIN_STRUCTLEAK=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++This plugin zero-initializes any structures containing a
++__user attribute. This can prevent some classes of information
++exposures.
++
++
++CONFIG_GCC_PLUGIN_STRUCTLEAK_BYREF_ALL=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Zero initialize any struct type local variable that may be passed by
++reference without having been initialized.
++
++
++CONFIG_HARDENED_USERCOPY=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++This option checks for obviously wrong memory regions when
++copying memory to/from the kernel (via copy_to_user() and
++copy_from_user() functions) by rejecting memory ranges that
++are larger than the specified heap object, span multiple
++separately allocated pages, are not on the process stack,
++or are part of the kernel text. This kills entire classes
++of heap overflow exploits and similar kernel memory exposures.
++
++
++CONFIG_HARDENED_USERCOPY_FALLBACK=n
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Kernel memory integrity
++
++This is a temporary option that allows missing usercopy whitelists
++to be discovered via a WARN() to the kernel log, instead of
++rejecting the copy, falling back to non-whitelisted hardened
++usercopy that checks the slab allocation size instead of the
++whitelist size. This option will be removed once it seems like
++all missing usercopy whitelists have been identified and fixed.
++Booting with "slab_common.usercopy_fallback=Y/N" can change
++this setting.
++
++
++CONFIG_HIBERNATION=n
++~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++Enabling suspend to disk (STD) functionality (hibernation)
++allows replacement of running kernel.
++
++
++CONFIG_IA32_EMULATION=n
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Attack surface reduction
++
++Include code to run legacy 32-bit programs under a 64-bit kernel.
++
++
++CONFIG_INET_DIAG=n
++~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Attack surface reduction
++
++Support for INET (TCP, DCCP, etc) socket monitoring interface used by
++native Linux tools such as ss. ss is included in iproute2.
++In the past, this was used to help heap memory attacks.
++
++
++CONFIG_KEXEC=n
++~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Attack surface reduction
++
++kexec is a system call that implements the ability to shutdown your
++current kernel, and to start another kernel.
++
++
++CONFIG_KEXEC_FILE=n
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Attack surface reduction
++
++Enable the kexec file based system call. In contrast to the normal
++kexec system call this system call takes file descriptors for the
++kernel and initramfs as arguments.
++
++
++CONFIG_KPROBES=n
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Kprobes allows you to trap at almost any kernel address and
++execute a callback function.
++
++
++CONFIG_LEGACY_PTYS=n
++~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** User space protection
++
++Linux has traditionally used the BSD-like names /dev/ptyxx
++for masters and /dev/ttyxx for slaves of pseudo
++terminals. This scheme has a number of problems, including
++security. This option enables these legacy devices.
++
++
++CONFIG_LEGACY_VSYSCALL_NONE=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** User space protection
++
++There will be no vsyscall mapping at all. This will
++eliminate any risk of ASLR bypass due to the vsyscall
++fixed address mapping. Attempts to use the vsyscalls
++will be reported to dmesg, so that either old or
++malicious userspace programs can be identified.
++
++
++CONFIG_LIVEPATCH=n
++~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++Kernel live patching support allows root to modify the running
++kernel. This is mainly used to apply security updates without
++rebooting, but it might be abused.
++
++
++CONFIG_EXPERT=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Prerequisite
++
++Needed to change CONFIG_MODIFY_LDT_SYSCALL.
++
++
++CONFIG_MODIFY_LDT_SYSCALL=n
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Attack surface reduction
++
++Linux can allow user programs to install a per-process x86
++Local Descriptor Table (LDT) using the modify_ldt(2) system
++call. This is required to run 16-bit or segmented code such as
++DOSEMU or some Wine programs. It is also used by some very old
++threading libraries.
++
++
++CONFIG_MODULES=n
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++Kernel modules are small pieces of compiled code which can
++be inserted in the running kernel, rather than being
++permanently built into the kernel.
++
++
++CONFIG_MODULE_SIG=y
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Check modules for valid signatures upon load: the signature
++is simply appended to the module.
++
++
++CONFIG_MODULE_SIG_ALL=y
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Sign all modules during make modules_install. Without this option,
++modules must be signed manually, using the scripts/sign-file tool.
++
++
++CONFIG_MODULE_SIG_FORCE=n
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Reject unsigned modules or signed modules for which we don't have a
++key. Without this, such modules will simply taint the kernel.
++
++
++CONFIG_MODULE_SIG_FORCE=y
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Self-protection
++
++Reject unsigned modules or signed modules for which we don't have a
++key. Without this, such modules will simply taint the kernel.
++
++
++CONFIG_MODULE_SIG_HASH="sha512"
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++This determines which sort of hashing algorithm will be used during
++signature generation.
++
++
++CONFIG_MODULE_SIG_SHA512=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++This determines which sort of hashing algorithm will be used during
++signature generation.
++
++
++CONFIG_PAGE_POISONING=y
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Fill the pages with poison patterns after free_pages() and verify
++the patterns before alloc_pages. The filling of the memory helps
++reduce the risk of information leaks from freed data. This does
++have a potential performance impact.
++Needs "page_poison=1" command line.
++
++
++CONFIG_PAGE_POISONING_NO_SANITY=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Skip the sanity checking on alloc, only fill the pages with
++poison on free. This reduces some of the overhead of the
++poisoning feature.
++
++
++CONFIG_PAGE_POISONING_NO_SANITY=n
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++Skip the sanity checking on alloc, only fill the pages with
++poison on free. This reduces some of the overhead of the
++poisoning feature.
++
++
++CONFIG_PAGE_POISONING_ZERO=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Instead of using the existing poison value, fill the pages with
++zeros. This makes it harder to detect when errors are occurring
++due to sanitization but the zeroing at free means that it is
++no longer necessary to write zeros when GFP_ZERO is used on
++allocation.
++
++
++CONFIG_PAGE_POISONING_ZERO=n
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Self-protection
++
++Instead of using the existing poison value, fill the pages with
++zeros. This makes it harder to detect when errors are occurring
++due to sanitization but the zeroing at free means that it is
++no longer necessary to write zeros when GFP_ZERO is used on
++allocation.
++
++
++CONFIG_PAGE_TABLE_ISOLATION=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Self-protection
++
++This feature reduces the number of hardware side channels by
++ensuring that the majority of kernel addresses are not mapped
++into userspace.
++
++See Documentation/x86/pti.txt for more details.
++
++
++CONFIG_PANIC_ON_OOPS=y
++~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++Say Y here to enable the kernel to panic when it oopses. This
++has the same effect as setting oops=panic on the kernel command
++line.
++
++
++CONFIG_PANIC_TIMEOUT=-1
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Self-protection
++
++Set the timeout value (in seconds) until a reboot occurs when the
++the kernel panics. If n = 0, then we wait forever. A timeout
++value n > 0 will wait n seconds before rebooting, while a timeout
++value n < 0 will reboot immediately.
++
++
++CONFIG_PROC_KCORE=n
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Provides a virtual ELF core file of the live kernel. This can
++be read with gdb and other ELF tools, exposing kernel layout.
++
++
++CONFIG_PROFILING=n
++~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Attack surface reduction
++
++Enable the extended profiling support mechanisms used
++by profilers such as OProfile.
++
++
++CONFIG_RANDOMIZE_BASE=y
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Randomizes the physical and virtual address at which the
++kernel image is loaded, as a security feature that
++deters exploit attempts relying on knowledge of the location
++of kernel internals.
++
++
++CONFIG_RANDOMIZE_MEMORY=y
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Randomizes the base virtual address of kernel memory sections
++(physical memory mapping, vmalloc & vmemmap). This security feature
++makes exploits relying on predictable memory locations less reliable.
++
++
++CONFIG_REFCOUNT_FULL=y
++~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++Enabling this switches the refcounting infrastructure from a fast
++unchecked atomic_t implementation to a fully state checked
++implementation, which can be (slightly) slower but provides protections
++against various use-after-free conditions that can be used in
++security flaw exploits.
++
++
++CONFIG_RETPOLINE=y
++~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Self-protection
++
++Compile kernel with the retpoline compiler options to guard against
++kernel-to-user data leaks by avoiding speculative indirect
++branches. Requires a compiler with -mindirect-branch=thunk-extern
++support for full protection. The kernel may run slower.
++
++Without compiler support, at least indirect branches in assembler
++code are eliminated. Since this includes the syscall entry path,
++it is not entirely pointless.
++
++
++CONFIG_SCHED_STACK_END_CHECK=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++This option checks for a stack overrun on calls to schedule().
++If the stack end location is found to be over written always panic as
++the content of the corrupted region can no longer be trusted.
++This is to ensure no erroneous behaviour occurs which could result in
++data corruption or a sporadic crash at a later stage once the region
++is examined. The runtime overhead introduced is minimal.
++
++
++CONFIG_SECCOMP=y
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** User space protection / Attack surface reduction
++
++This kernel feature is useful for number crunching applications
++that may need to compute untrusted bytecode during their
++execution.
++
++
++CONFIG_SECCOMP_FILTER=y
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** User space protection / Attack surface reduction
++
++Enable tasks to build secure computing environments defined
++in terms of Berkeley Packet Filter programs which implement
++task-defined system call filtering polices.
++
++See Documentation/prctl/seccomp_filter.txt for details.
++
++
++CONFIG_SECURITY=y
++~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Generic
++
++This allows you to choose different security modules to be
++configured into your kernel.
++
++
++CONFIG_SECURITY_DMESG_RESTRICT=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** Self-protection
++
++This enforces restrictions on unprivileged users reading the kernel
++syslog via dmesg(8).
++
++
++CONFIG_SECURITY_SELINUX_DISABLE=n
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Generic
++
++This option enables writing to a selinuxfs node 'disable', which
++allows SELinux to be disabled at runtime prior to the policy load.
++SELinux will then remain disabled until the next boot.
++
++
++CONFIG_SECURITY_YAMA=y
++~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Medium
++**- Protection type:** User space protection
++
++This selects Yama, which extends DAC support with additional
++system-wide security settings beyond regular Linux discretionary
++access controls. Currently available is ptrace scope restriction.
++
++
++CONFIG_SLAB_FREELIST_HARDENED=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Many kernel heap attacks try to target slab cache metadata and
++other infrastructure. This options makes minor performance
++sacrifies to harden the kernel slab allocator against common
++freelist exploit methods.
++
++
++CONFIG_SLAB_FREELIST_RANDOM=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Randomizes the freelist order used on creating new pages. This
++security feature reduces the predictability of the kernel slab
++allocator against heap overflows.
++
++
++CONFIG_SLUB_DEBUG=y
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Enalbe SLUB debug support features.
++
++
++CONFIG_SLUB_DEBUG_ON=y
++~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** Self-protection
++
++Boot with debugging on by default. SLUB debugging may be switched
++off in a kernel built with CONFIG_SLUB_DEBUG_ON by specifying
++"slub_debug=-".
++
++
++CONFIG_STRICT_KERNEL_RWX=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Kernel text and rodata memory will be made read-only, and non-text memory will
++be made non-executable. This provides protection against certain security
++exploits (e.g. executing the heap or modifying text).
++These features are considered standard security practice these days.
++
++
++CONFIG_STRICT_MODULE_RWX=y
++~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++If this is set, module text and rodata memory will be made read-only,
++and non-text memory will be made non-executable. This provides
++protection against certain security exploits (e.g. writing to text)
++
++
++CONFIG_SYN_COOKIES=y
++~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** User space protection
++
++Normal TCP/IP networking is open to an attack known as "SYN flooding".
++This denial-of-service attack prevents legitimate remote users from being
++able to connect to your computer during an ongoing attack and requires very
++little work from the attacker, who can operate from anywhere on the Internet.
++SYN cookies provide protection against this type of attack.
++SYN cookies may prevent correct error reporting on clients when the server is
++really overloaded. If this happens frequently better turn them off.
++Note that SYN cookies aren't enabled by default; you can enable them by saying
++Y to "/proc file system support" and "Sysctl support" below and executing the
++command:
++
++echo 1 >/proc/sys/net/ipv4/tcp_syncookies
++
++at boot time after the /proc file system has been mounted.
++
++
++CONFIG_UPROBES=n
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** High
++**- Protection type:** User space protection
++
++Uprobes is the user-space counterpart to kprobes: they
++enable instrumentation applications (such as 'perf probe')
++to establish unintrusive probes in user-space binaries and
++libraries, by executing handler functions when the probes
++are hit by user-space applications.
++
++
++CONFIG_USER_NS=n
++~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Extreme
++**- Protection type:** Attack surface reduction
++
++This allows containers to use user namespaces to provide different
++user info for different servers.
++Correct use of user namespaces can increase security and there are
++no known issues at the time of writing.
++But they have been abused in the past for privilege escalation due
++to implementation mistakes.
++Disabling this feature, if it isn't needed, can be useful to
++reduce the attack surface.
++
++
++CONFIG_VMAP_STACK=y
++~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Enable this if you want the use virtually-mapped kernel stacks
++with guard pages. This causes kernel stack overflows to be
++caught immediately rather than causing difficult-to-diagnose
++corruption.
++This is presently incompatible with KASAN.
++
++
++CONFIG_X86_SMAP=y
++~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Self-protection
++
++Supervisor Mode Access Prevention (SMAP) is a security feature in newer
++Intel processors. There is a small performance cost if this enabled and
++turned on; there is also a small increase in the kernel size if this is
++enabled.
++
++
++CONFIG_X86_INTEL_UMIP=y
++~~~~~~~~~~~~~~~~~~~~~~~
++
++**Negative side effects level:** Low
++**- Protection type:** Information leak prevention
++
++The User Mode Instruction Prevention (UMIP) is a security feature in newer
++Intel processors. If enabled, a general protection fault is issued if the
++SGDT, SLDT, SIDT, SMSW or STR instructions are executed in user mode.
++These instructions unnecessarily expose information about the hardware state.
++The vast majority of applications do not use these instructions. For the very
++few that do, software emulation is provided in specific cases in protected and
++virtual-8086 modes. Emulated results are dummy.
+diff -Nurp a/Documentation/security/index.rst b/Documentation/security/index.rst
+--- a/Documentation/security/index.rst	2018-11-13 20:09:00.000000000 +0100
++++ b/Documentation/security/index.rst	2018-11-20 10:51:05.315825458 +0100
+@@ -13,3 +13,4 @@ Security Documentation
+    SELinux-sctp
+    self-protection
+    tpm/index
++   hardenedconfig
+diff -Nurp a/Documentation/security/tpe.txt b/Documentation/security/tpe.txt
+--- a/Documentation/security/tpe.txt	1970-01-01 01:00:00.000000000 +0100
++++ b/Documentation/security/tpe.txt	2018-11-20 10:51:05.319825473 +0100
+@@ -0,0 +1,59 @@
++Trusted Path Execution is a Linux Security Module that generally requires
++programs to be run from a trusted path. A trusted path is one that is owned by
++root and is not group/world writable. This prevents an attacker from executing
++their own malicious binaries from an unprivileged user on the system. This
++feature is enabled with CONFIG_SECURITY_TPE. When enabled, a set of sysctls
++are created in /proc/sys/kernel/tpe.
++
++---------------------------------------------------------------------------
++
++Trusted Path Execution introduces the following Kconfig options and sysctls.
++
++CONFIG_SECURITY_TPE (sysctl=kernel.tpe.enabled)
++
++default: n
++
++This option enables Trusted Path Execution. TPE blocks *untrusted*
++users from executing files that meet the following conditions:
++
++* file is not in a root-owned directory
++* file is writable by a user other than root
++
++NOTE: By default root is not restricted by TPE.
++
++CONFIG_SECURITY_TPE_GID (sysctl=kernel.tpe.gid)
++
++default: 0
++
++This option defines a group id that, by default, is the trusted group.
++If a user is not trusted then it has the checks described in
++CONFIG_SECURITY_TPE applied. Otherwise, the user is trusted and the
++checks are not applied. You can disable the trusted gid option by
++setting it to 0. This makes all non-root users untrusted.
++
++CONFIG_SECURITY_TPE_STRICT (sysctl=kernel.tpe.strict)
++
++default: n
++
++This option applies another set of restrictions to all non-root users
++even if they are trusted. This only allows execution under the
++following conditions:
++
++* file is in a directory owned by the user that is not group or
++  world-writable
++* file is in a directory owned by root and writable only by root
++
++CONFIG_SECURITY_TPE_RESTRICT_ROOT (sysctl=kernel.tpe.restrict_root)
++
++default: n
++
++This option applies TPE restrictions to root.
++
++CONFIG_SECURITY_TPE_INVERT_GID (sysctl=kernel.tpe.invert_gid)
++
++default: n
++
++This option reverses the trust logic of the gid option and makes
++kernel.tpe.gid into the untrusted group. This means that all other groups
++become trusted. This sysctl is helpful when you want TPE restrictions
++to be limited to a small subset of users.
+diff -Nurp a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+--- a/fs/binfmt_elf.c	2018-11-13 20:09:00.000000000 +0100
++++ b/fs/binfmt_elf.c	2018-11-20 10:51:05.319825473 +0100
+@@ -808,7 +808,8 @@ static int load_elf_binary(struct linux_
+ 	for (i = 0; i < loc->elf_ex.e_phnum; i++, elf_ppnt++)
+ 		switch (elf_ppnt->p_type) {
+ 		case PT_GNU_STACK:
+-			if (elf_ppnt->p_flags & PF_X)
++			if (elf_ppnt->p_flags & PF_X &&
++			    !security_check_vmflags(VM_EXEC|VM_READ|VM_WRITE))
+ 				executable_stack = EXSTACK_ENABLE_X;
+ 			else
+ 				executable_stack = EXSTACK_DISABLE_X;
+diff -Nurp a/fs/binfmt_elf_fdpic.c b/fs/binfmt_elf_fdpic.c
+--- a/fs/binfmt_elf_fdpic.c	2018-11-13 20:09:00.000000000 +0100
++++ b/fs/binfmt_elf_fdpic.c	2018-11-20 10:51:05.319825473 +0100
+@@ -167,7 +167,8 @@ static int elf_fdpic_fetch_phdrs(struct
+ 		if (phdr->p_type != PT_GNU_STACK)
+ 			continue;
+ 
+-		if (phdr->p_flags & PF_X)
++		if (phdr->p_flags & PF_X &&
++		    !security_check_vmflags(VM_EXEC|VM_READ|VM_WRITE))
+ 			params->flags |= ELF_FDPIC_FLAG_EXEC_STACK;
+ 		else
+ 			params->flags |= ELF_FDPIC_FLAG_NOEXEC_STACK;
+diff -Nurp a/fs/exec.c b/fs/exec.c
+--- a/fs/exec.c	2018-11-13 20:09:00.000000000 +0100
++++ b/fs/exec.c	2018-11-20 10:51:05.319825473 +0100
+@@ -752,6 +752,10 @@ int setup_arg_pages(struct linux_binprm
+ 	vm_flags |= mm->def_flags;
+ 	vm_flags |= VM_STACK_INCOMPLETE_SETUP;
+ 
++	ret = security_check_vmflags(vm_flags);
++	if (ret)
++		goto out_unlock;
++
+ 	ret = mprotect_fixup(vma, &prev, vma->vm_start, vma->vm_end,
+ 			vm_flags);
+ 	if (ret)
+diff -Nurp a/fs/namei.c b/fs/namei.c
+--- a/fs/namei.c	2018-11-13 20:09:00.000000000 +0100
++++ b/fs/namei.c	2018-11-20 10:51:05.323825489 +0100
+@@ -508,12 +508,60 @@ struct nameidata {
+ 	struct inode	*link_inode;
+ 	unsigned	root_seq;
+ 	int		dfd;
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	struct path     *symlinkown_stack;
++	struct path     symlinkown_internal[EMBEDDED_LEVELS];
++	unsigned        symlinkown_depth;
++	int             symlinkown_enabled;
++#endif
+ } __randomize_layout;
+ 
++#define gr_is_global_nonroot(x) (!uid_eq((x), GLOBAL_ROOT_UID))
++
++int gr_get_symlinkown_enabled(void)
++{
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	if (grsec_enable_symlinkown && in_group_p(grsec_symlinkown_gid))
++		return 1;
++#endif
++	return 0;
++}
++
++int gr_handle_symlink_owner(const struct path *link, const struct inode *target)
++{
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	const struct inode *link_inode = d_backing_inode(link->dentry);
++
++	if (target && !uid_eq(link_inode->i_uid, target->i_uid)) {
++/*		gr_log_fs_int2(GR_DONT_AUDIT, GR_SYMLINKOWNER_MSG, link->dentry, link->mnt, GR_GLOBAL_UID(link_inode->i_uid), GR_GLOBAL_UID(target->i_uid));*/
++		return 1;
++	}
++#endif
++	return 0;
++}
++
++
++static int gr_handle_nameidata_symlinkowner(const struct nameidata *nd, const struct inode *target)
++{
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	int i;
++
++	for (i = 0; i < nd->symlinkown_depth; i++) {
++		if (gr_handle_symlink_owner(&nd->symlinkown_stack[i], target))
++			return -EACCES;
++	}
++#endif
++	return 0;
++}
++
+ static void set_nameidata(struct nameidata *p, int dfd, struct filename *name)
+ {
+ 	struct nameidata *old = current->nameidata;
+ 	p->stack = p->internal;
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	p->symlinkown_stack = p->symlinkown_internal;
++	p->symlinkown_enabled = -1;
++#endif
+ 	p->dfd = dfd;
+ 	p->name = name;
+ 	p->total_link_count = old ? old->total_link_count : 0;
+@@ -530,6 +578,10 @@ static void restore_nameidata(void)
+ 		old->total_link_count = now->total_link_count;
+ 	if (now->stack != now->internal)
+ 		kfree(now->stack);
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	if (now->symlinkown_stack != now->symlinkown_internal)
++		kfree(now->symlinkown_stack);
++#endif
+ }
+ 
+ static int __nd_alloc_stack(struct nameidata *nd)
+@@ -571,8 +623,32 @@ static bool path_connected(const struct
+ 	return is_subdir(path->dentry, mnt->mnt_root);
+ }
+ 
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++static int nd_alloc_symlinkown_stack(struct nameidata *nd)
++{
++	struct path *p;
++
++	if (likely(nd->symlinkown_depth != EMBEDDED_LEVELS))
++		return 0;
++	if (nd->symlinkown_stack != nd->symlinkown_internal)
++		return 0;
++
++	p = kmalloc(MAXSYMLINKS * sizeof(struct path), GFP_KERNEL);
++	if (unlikely(!p))
++		return -ENOMEM;
++	memcpy(p, nd->symlinkown_internal, sizeof(nd->symlinkown_internal));
++	nd->symlinkown_stack = p;
++	return 0;
++}
++#endif
++
+ static inline int nd_alloc_stack(struct nameidata *nd)
+ {
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	if (nd->flags & LOOKUP_RCU)
++		return -ECHILD;
++#endif
++
+ 	if (likely(nd->depth != EMBEDDED_LEVELS))
+ 		return 0;
+ 	if (likely(nd->stack != nd->internal))
+@@ -598,6 +674,14 @@ static void terminate_walk(struct nameid
+ 		path_put(&nd->path);
+ 		for (i = 0; i < nd->depth; i++)
+ 			path_put(&nd->stack[i].link);
++
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	/* we'll only ever set our values in ref-walk mode */
++		for (i = 0; i < nd->symlinkown_depth; i++)
++			path_put(&nd->symlinkown_stack[i]);
++		nd->symlinkown_depth = 0;
++#endif
++
+ 		if (nd->root.mnt && !(nd->flags & LOOKUP_ROOT)) {
+ 			path_put(&nd->root);
+ 			nd->root.mnt = NULL;
+@@ -887,6 +971,10 @@ static inline void put_link(struct namei
+ 
+ int sysctl_protected_symlinks __read_mostly = 0;
+ int sysctl_protected_hardlinks __read_mostly = 0;
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++int grsec_enable_symlinkown = 1;
++kgid_t grsec_symlinkown_gid = KGIDT_INIT(CONFIG_GRKERNSEC_SYMLINKOWN_GID);
++#endif
+ int sysctl_protected_fifos __read_mostly;
+ int sysctl_protected_regular __read_mostly;
+ 
+@@ -1749,6 +1837,23 @@ static int pick_link(struct nameidata *n
+ 		}
+ 	}
+ 
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	if (unlikely(nd->symlinkown_enabled == -1))
++		nd->symlinkown_enabled = gr_get_symlinkown_enabled();
++	if (nd->symlinkown_enabled && gr_is_global_nonroot(inode->i_uid)) {
++		struct path *symlinkownlast;
++		error = nd_alloc_symlinkown_stack(nd);
++		if (unlikely(error)) {
++			path_put(link);
++			return error;
++		}
++		symlinkownlast = nd->symlinkown_stack + nd->symlinkown_depth++;
++		symlinkownlast->dentry = link->dentry;
++		symlinkownlast->mnt = link->mnt;
++		path_get(symlinkownlast);
++	}
++#endif
++
+ 	last = nd->stack + nd->depth++;
+ 	last->link = *link;
+ 	clear_delayed_call(&last->done);
+@@ -2181,6 +2286,10 @@ static const char *path_init(struct name
+ 	nd->last_type = LAST_ROOT; /* if there are only slashes... */
+ 	nd->flags = flags | LOOKUP_JUMPED | LOOKUP_PARENT;
+ 	nd->depth = 0;
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	nd->symlinkown_depth = 0;
++#endif
++
+ 	if (flags & LOOKUP_ROOT) {
+ 		struct dentry *root = nd->root.dentry;
+ 		struct inode *inode = root->d_inode;
+@@ -2366,6 +2475,10 @@ static int path_parentat(struct nameidat
+ 	int err = link_path_walk(s, nd);
+ 	if (!err)
+ 		err = complete_walk(nd);
++
++	if (!err && gr_handle_nameidata_symlinkowner(nd, nd->inode))
++		err = -EACCES;
++
+ 	if (!err) {
+ 		*parent = nd->path;
+ 		nd->path.mnt = NULL;
+@@ -3225,6 +3338,10 @@ no_open:
+ 
+ 	/* Negative dentry, just create the file */
+ 	if (!dentry->d_inode && (open_flag & O_CREAT)) {
++		if (gr_handle_nameidata_symlinkowner(nd, dir_inode)) {
++			error = -EACCES;
++			goto out_dput;
++		}
+ 		file->f_mode |= FMODE_CREATED;
+ 		audit_inode_child(dir_inode, dentry, AUDIT_TYPE_CHILD_CREATE);
+ 		if (!dir_inode->i_op->create) {
+@@ -3388,6 +3505,12 @@ finish_open:
+ 	error = complete_walk(nd);
+ 	if (error)
+ 		return error;
++
++	if (gr_handle_nameidata_symlinkowner(nd, nd->inode)) {
++		error = -EACCES;
++		goto out;
++	}
++
+ 	audit_inode(nd->name, nd->path.dentry, 0);
+ 	if (open_flag & O_CREAT) {
+ 		error = -EISDIR;
+diff -Nurp a/fs/proc/base.c b/fs/proc/base.c
+--- a/fs/proc/base.c	2018-11-13 20:09:00.000000000 +0100
++++ b/fs/proc/base.c	2018-11-20 10:51:05.323825489 +0100
+@@ -2580,6 +2580,40 @@ static const struct file_operations proc
+ 	.llseek		= generic_file_llseek,
+ };
+ 
++#ifdef CONFIG_SECURITY_SARA
++static const struct pid_entry sara_attr_dir_stuff[] = {
++	REG("wxprot", 0666, proc_pid_attr_operations),
++};
++
++static int proc_sara_attr_dir_readdir(struct file *file,
++				      struct dir_context *ctx)
++{
++	return proc_pident_readdir(file, ctx,
++				   sara_attr_dir_stuff,
++				   ARRAY_SIZE(sara_attr_dir_stuff));
++}
++
++static const struct file_operations proc_sara_attr_dir_ops = {
++	.read		= generic_read_dir,
++	.iterate_shared	= proc_sara_attr_dir_readdir,
++	.llseek		= generic_file_llseek,
++};
++
++static struct dentry *proc_sara_attr_dir_lookup(struct inode *dir,
++				struct dentry *dentry, unsigned int flags)
++{
++	return proc_pident_lookup(dir, dentry,
++				  sara_attr_dir_stuff,
++				  ARRAY_SIZE(sara_attr_dir_stuff));
++};
++
++static const struct inode_operations proc_sara_attr_dir_inode_ops = {
++	.lookup		= proc_sara_attr_dir_lookup,
++	.getattr	= pid_getattr,
++	.setattr	= proc_setattr,
++};
++#endif /* CONFIG_SECURITY_SARA */
++
+ static const struct pid_entry attr_dir_stuff[] = {
+ 	REG("current",    S_IRUGO|S_IWUGO, proc_pid_attr_operations),
+ 	REG("prev",       S_IRUGO,	   proc_pid_attr_operations),
+@@ -2587,6 +2621,10 @@ static const struct pid_entry attr_dir_s
+ 	REG("fscreate",   S_IRUGO|S_IWUGO, proc_pid_attr_operations),
+ 	REG("keycreate",  S_IRUGO|S_IWUGO, proc_pid_attr_operations),
+ 	REG("sockcreate", S_IRUGO|S_IWUGO, proc_pid_attr_operations),
++#ifdef CONFIG_SECURITY_SARA
++	DIR("sara", 0555, proc_sara_attr_dir_inode_ops,
++				proc_sara_attr_dir_ops),
++#endif
+ };
+ 
+ static int proc_attr_dir_readdir(struct file *file, struct dir_context *ctx)
+diff -Nurp a/.gitignore b/.gitignore
+--- a/.gitignore	2018-11-13 20:09:00.000000000 +0100
++++ b/.gitignore	2018-11-20 10:51:05.347825582 +0100
+@@ -132,3 +132,6 @@ all.config
+ 
+ # Kdevelop4
+ *.kdev4
++
++# Generated config fragments
++kernel/configs/generated
+diff -Nurp a/include/linux/cred.h b/include/linux/cred.h
+--- a/include/linux/cred.h	2018-11-13 20:09:00.000000000 +0100
++++ b/include/linux/cred.h	2018-11-20 10:51:05.347825582 +0100
+@@ -147,6 +147,9 @@ struct cred {
+ #ifdef CONFIG_SECURITY
+ 	void		*security;	/* subjective LSM security */
+ #endif
++#ifdef CONFIG_SECURITY_SARA
++	void		*security_sara;
++#endif
+ 	struct user_struct *user;	/* real user ID subscription */
+ 	struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+ 	struct group_info *group_info;	/* supplementary groups for euid/fsgid */
+diff -Nurp a/include/linux/fs.h b/include/linux/fs.h
+--- a/include/linux/fs.h	2018-11-13 20:09:00.000000000 +0100
++++ b/include/linux/fs.h	2018-11-20 10:51:05.351825597 +0100
+@@ -74,6 +74,10 @@ extern struct inodes_stat_t inodes_stat;
+ extern int leases_enable, lease_break_time;
+ extern int sysctl_protected_symlinks;
+ extern int sysctl_protected_hardlinks;
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++extern int grsec_enable_symlinkown;
++extern kgid_t grsec_symlinkown_gid;
++#endif
+ extern int sysctl_protected_fifos;
+ extern int sysctl_protected_regular;
+ 
+@@ -601,6 +605,10 @@ struct inode {
+ 	void			*i_security;
+ #endif
+ 
++#ifdef CONFIG_SECURITY_SARA
++	void			*security_sara;
++#endif
++
+ 	/* Stat data, not accessed from path walking */
+ 	unsigned long		i_ino;
+ 	/*
+diff -Nurp a/include/linux/ipc.h b/include/linux/ipc.h
+--- a/include/linux/ipc.h	2018-11-13 20:09:00.000000000 +0100
++++ b/include/linux/ipc.h	2018-11-20 10:51:05.351825597 +0100
+@@ -21,6 +21,9 @@ struct kern_ipc_perm {
+ 	umode_t		mode;
+ 	unsigned long	seq;
+ 	void		*security;
++#ifdef CONFIG_SECURITY_SARA
++	void		*security_sara;
++#endif
+ 
+ 	struct rhash_head khtnode;
+ 
+diff -Nurp a/include/linux/lsm_hooks.h b/include/linux/lsm_hooks.h
+--- a/include/linux/lsm_hooks.h	2018-11-13 20:09:00.000000000 +0100
++++ b/include/linux/lsm_hooks.h	2018-11-20 10:51:05.355825612 +0100
+@@ -484,6 +484,19 @@
+  *	@reqprot contains the protection requested by the application.
+  *	@prot contains the protection that will be applied by the kernel.
+  *	Return 0 if permission is granted.
++ * @check_vmflags:
++ *	Check if the requested @vmflags are allowed.
++ *	@vmflags contains the requested vmflags.
++ *	Return 0 if the operation is allowed to continue otherwise return
++ *	the appropriate error code.
++ * @pagefault_handler:
++ *	Handle pagefaults on supported architectures, that is any architecture
++ *	which defines CONFIG_ARCH_HAS_LSM_PAGEFAULT.
++ *	@regs contains process' registers.
++ *	@error_code contains error code for the pagefault.
++ *	@address contains the address that caused the pagefault.
++ *	Return 0 to let the kernel handle the pagefault as usually, any other
++ *	value to let the process continue its execution.
+  * @file_lock:
+  *	Check permission before performing file locking operations.
+  *	Note: this hook mediates both flock and fcntl style locks.
+@@ -1566,6 +1579,10 @@ union security_list_options {
+ 				unsigned long prot, unsigned long flags);
+ 	int (*file_mprotect)(struct vm_area_struct *vma, unsigned long reqprot,
+ 				unsigned long prot);
++	int (*check_vmflags)(vm_flags_t vmflags);
++	int (*pagefault_handler)(struct pt_regs *regs,
++				 unsigned long error_code,
++				 unsigned long address);
+ 	int (*file_lock)(struct file *file, unsigned int cmd);
+ 	int (*file_fcntl)(struct file *file, unsigned int cmd,
+ 				unsigned long arg);
+@@ -1862,6 +1879,8 @@ struct security_hook_heads {
+ 	struct hlist_head mmap_addr;
+ 	struct hlist_head mmap_file;
+ 	struct hlist_head file_mprotect;
++	struct hlist_head check_vmflags;
++	struct hlist_head pagefault_handler;
+ 	struct hlist_head file_lock;
+ 	struct hlist_head file_fcntl;
+ 	struct hlist_head file_set_fowner;
+@@ -2081,5 +2100,15 @@ void __init loadpin_add_hooks(void);
+ #else
+ static inline void loadpin_add_hooks(void) { };
+ #endif
++#ifdef CONFIG_SECURITY_SARA
++void __init sara_init(void);
++#else
++static inline void __init sara_init(void) { };
++#endif
++#ifdef CONFIG_SECURITY_TPE
++void __init tpe_add_hooks(void);
++#else
++static inline void tpe_add_hooks(void) { };
++#endif
+ 
+ #endif /* ! __LINUX_LSM_HOOKS_H */
+diff -Nurp a/include/linux/security.h b/include/linux/security.h
+--- a/include/linux/security.h	2018-11-13 20:09:00.000000000 +0100
++++ b/include/linux/security.h	2018-11-20 10:51:05.355825612 +0100
+@@ -324,6 +324,10 @@ int security_mmap_file(struct file *file
+ int security_mmap_addr(unsigned long addr);
+ int security_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
+ 			   unsigned long prot);
++int security_check_vmflags(vm_flags_t vmflags);
++int __maybe_unused security_pagefault_handler(struct pt_regs *regs,
++					      unsigned long error_code,
++					      unsigned long address);
+ int security_file_lock(struct file *file, unsigned int cmd);
+ int security_file_fcntl(struct file *file, unsigned int cmd, unsigned long arg);
+ void security_file_set_fowner(struct file *file);
+@@ -851,6 +855,19 @@ static inline int security_file_mprotect
+ {
+ 	return 0;
+ }
++
++static inline int security_check_vmflags(vm_flags_t vmflags)
++{
++	return 0;
++}
++
++static inline int __maybe_unused security_pagefault_handler(
++						struct pt_regs *regs,
++						unsigned long error_code,
++						unsigned long address)
++{
++	return 0;
++}
+ 
+ static inline int security_file_lock(struct file *file, unsigned int cmd)
+ {
+diff -Nurp a/include/uapi/linux/xattr.h b/include/uapi/linux/xattr.h
+--- a/include/uapi/linux/xattr.h	2018-11-13 20:09:00.000000000 +0100
++++ b/include/uapi/linux/xattr.h	2018-11-20 10:51:05.355825612 +0100
+@@ -77,5 +77,9 @@
+ #define XATTR_POSIX_ACL_DEFAULT  "posix_acl_default"
+ #define XATTR_NAME_POSIX_ACL_DEFAULT XATTR_SYSTEM_PREFIX XATTR_POSIX_ACL_DEFAULT
+ 
++#define XATTR_SARA_SUFFIX "sara."
++#define XATTR_SARA_WXP_SUFFIX XATTR_SARA_SUFFIX "wxp"
++#define XATTR_NAME_SEC_SARA_WXP XATTR_SECURITY_PREFIX XATTR_SARA_WXP_SUFFIX
++#define XATTR_NAME_USR_SARA_WXP XATTR_USER_PREFIX XATTR_SARA_WXP_SUFFIX
+ 
+ #endif /* _UAPI_LINUX_XATTR_H */
+diff -Nurp a/kernel/sysctl.c b/kernel/sysctl.c
+--- a/kernel/sysctl.c	2018-11-13 20:09:00.000000000 +0100
++++ b/kernel/sysctl.c	2018-11-20 10:51:05.359825628 +0100
+@@ -1798,6 +1798,24 @@ static struct ctl_table fs_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &one,
+ 	},
++#ifdef CONFIG_GRKERNSEC_SYMLINKOWN
++	{
++		.procname	= "enforce_symlinksifowner",
++		.data		= &grsec_enable_symlinkown,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one,
++	},
++	{
++		.procname	= "symlinkown_gid",
++		.data		= &grsec_symlinkown_gid,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
++#endif
+ 	{
+ 		.procname	= "protected_hardlinks",
+ 		.data		= &sysctl_protected_hardlinks,
+diff -Nurp a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS	2018-11-13 20:09:00.000000000 +0100
++++ b/MAINTAINERS	2018-11-20 10:51:05.391825752 +0100
+@@ -13085,6 +13085,11 @@ F:	security/selinux/
+ F:	scripts/selinux/
+ F:	Documentation/admin-guide/LSM/SELinux.rst
+ 
++TPE SECURITY MODULE
++M:	Matt Brown <matt@nmatt.com>
++S:	Supported
++F:	security/tpe/
++
+ SENSABLE PHANTOM
+ M:	Jiri Slaby <jirislaby@gmail.com>
+ S:	Maintained
+diff -Nurp a/Makefile b/Makefile
+--- a/Makefile	2018-11-13 20:09:00.000000000 +0100
++++ b/Makefile	2018-11-20 10:51:05.395825767 +0100
+@@ -1303,7 +1303,8 @@ MRPROPER_FILES += .config .config.old .v
+ 		  Module.symvers tags TAGS cscope* GPATH GTAGS GRTAGS GSYMS \
+ 		  signing_key.pem signing_key.priv signing_key.x509	\
+ 		  x509.genkey extra_certificates signing_key.x509.keyid	\
+-		  signing_key.x509.signer vmlinux-gdb.py
++		  signing_key.x509.signer vmlinux-gdb.py	\
++		  kernel/configs/generated/*
+ 
+ # clean - Delete most, but leave enough to build external modules
+ #
+diff -Nurp a/mm/mmap.c b/mm/mmap.c
+--- a/mm/mmap.c	2018-11-13 20:09:00.000000000 +0100
++++ b/mm/mmap.c	2018-11-20 10:51:05.395825767 +0100
+@@ -1364,6 +1364,7 @@ unsigned long do_mmap(struct file *file,
+ {
+ 	struct mm_struct *mm = current->mm;
+ 	int pkey = 0;
++	int error;
+ 
+ 	*populate = 0;
+ 
+@@ -1427,6 +1428,10 @@ unsigned long do_mmap(struct file *file,
+ 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+ 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+ 
++	error = security_check_vmflags(vm_flags);
++	if (error)
++		return error;
++
+ 	if (flags & MAP_LOCKED)
+ 		if (!can_do_mlock())
+ 			return -EPERM;
+@@ -2938,6 +2943,10 @@ static int do_brk_flags(unsigned long ad
+ 		return -EINVAL;
+ 	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+ 
++	error = security_check_vmflags(flags);
++	if (error)
++		return error;
++
+ 	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
+ 	if (offset_in_page(error))
+ 		return error;
+@@ -3341,6 +3350,10 @@ static struct vm_area_struct *__install_
+ 	int ret;
+ 	struct vm_area_struct *vma;
+ 
++	ret = security_check_vmflags(vm_flags);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	vma = vm_area_alloc(mm);
+ 	if (unlikely(vma == NULL))
+ 		return ERR_PTR(-ENOMEM);
+diff -Nurp a/scripts/kconfig/build_hardened_fragment.sh b/scripts/kconfig/build_hardened_fragment.sh
+--- a/scripts/kconfig/build_hardened_fragment.sh	1970-01-01 01:00:00.000000000 +0100
++++ b/scripts/kconfig/build_hardened_fragment.sh	2018-11-20 10:51:05.395825767 +0100
+@@ -0,0 +1,54 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0
++#
++#  build_hardened_fragment.sh - Generate a config fragment from an .rst
++#  file for the specified level.
++#
++#  Copyright 2018 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++#
++#  This program is free software; you can redistribute it and/or modify
++#  it under the terms of the GNU General Public License version 2 as
++#  published by the Free Software Foundation.
++#
++#  This program is distributed in the hope that it will be useful,
++#  but WITHOUT ANY WARRANTY; without even the implied warranty of
++#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++#  See the GNU General Public License for more details.
++
++usage() {
++	echo "Usage: $0 <level> <file.rst>" >&2
++	echo "Level must be one of: low, medium, high, extreme." >&2
++	exit 1
++}
++
++if [ "$#" -ne 2 ]; then
++	usage
++fi
++
++LEVEL="$(echo $1 | tr [A-Z] [a-z])"
++INPUT="$2"
++
++if [ "$LEVEL" != "low" ] && \
++   [ "$LEVEL" != "medium" ] && \
++   [ "$LEVEL" != "high" ] && \
++   [ "$LEVEL" != "extreme" ]; then
++	usage
++fi
++
++if ! [ -f "$INPUT" ]; then
++	usage
++fi
++
++if [ "$LEVEL" = "medium" ]; then
++	LEVEL="(low|medium)"
++elif [ "$LEVEL" = "high" ]; then
++	LEVEL="(low|medium|high)"
++elif [ "$LEVEL" = "extreme" ]; then
++	LEVEL="(low|medium|high|extreme)"
++fi
++
++egrep -B3 -i "^\*\*Negative side effects level:\*\* $LEVEL$" "$INPUT" | \
++grep "^CONFIG_" | \
++sed 's/^\(.*\)=[nN]/# \1 is not set/'
++
++exit 0
+diff -Nurp a/scripts/kconfig/Makefile b/scripts/kconfig/Makefile
+--- a/scripts/kconfig/Makefile	2018-11-13 20:09:00.000000000 +0100
++++ b/scripts/kconfig/Makefile	2018-11-20 10:51:05.399825783 +0100
+@@ -105,6 +105,17 @@ endif
+ 
+ configfiles=$(wildcard $(srctree)/kernel/configs/$@ $(srctree)/arch/$(SRCARCH)/configs/$@)
+ 
++hardened%.config:
++	mkdir $(srctree)/kernel/configs/generated/ || true
++	$(CONFIG_SHELL) $(srctree)/scripts/kconfig/build_hardened_fragment.sh \
++	$* $(srctree)/Documentation/security/hardenedconfig.rst > \
++	$(srctree)/kernel/configs/generated/hardened$*.config
++	$(eval configfiles += $(srctree)/kernel/configs/generated/hardened$*.config)
++
++	$(if $(call configfiles),, $(error No configuration exists for this target on this architecture))
++	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/kconfig/merge_config.sh -m .config $(configfiles)
++	+$(Q)yes "" | $(MAKE) -f $(srctree)/Makefile oldconfig
++
+ %.config: $(obj)/conf
+ 	$(if $(call configfiles),, $(error No configuration exists for this target on this architecture))
+ 	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/kconfig/merge_config.sh -m .config $(configfiles)
+@@ -122,6 +133,16 @@ PHONY += tinyconfig
+ tinyconfig:
+ 	$(Q)$(MAKE) -f $(srctree)/Makefile allnoconfig tiny.config
+ 
++PHONY += hardenedlowconfig hardenedmediumconfig hardenedhighconfig hardenedextremeconfig
++hardenedlowconfig: hardenedlow.config
++	@:
++hardenedmediumconfig: hardenedmedium.config
++	@:
++hardenedhighconfig: hardenedhigh.config
++	@:
++hardenedextremeconfig: hardenedextreme.config
++	@:
++
+ # CHECK: -o cache_dir=<path> working?
+ PHONY += testconfig
+ testconfig: $(obj)/conf
+@@ -154,6 +175,14 @@ help:
+ 	@echo  '  xenconfig       - Enable additional options for xen dom0 and guest kernel support'
+ 	@echo  '  tinyconfig	  - Configure the tiniest possible kernel'
+ 	@echo  '  testconfig	  - Run Kconfig unit tests (requires python3 and pytest)'
++	@echo  '  hardenedlowconfig     - Update current config using hardened features with'
++	@echo  '                          few negative side effects'
++	@echo  '  hardenedmediumconfig  - Update current config using hardened features with'
++	@echo  '                          some negative side effects'
++	@echo  '  hardenedhighconfig    - Update current config using hardened features with'
++	@echo  '                          many negative side effects'
++	@echo  '  hardenedextremeconfig - Update current config using hardened features with'
++	@echo  '                          even more negative side effects'
+ 
+ # ===========================================================================
+ # Shared Makefile for the various kconfig executables:
+diff -Nurp a/security/Kconfig b/security/Kconfig
+--- a/security/Kconfig	2018-11-13 20:09:00.000000000 +0100
++++ b/security/Kconfig	2018-11-20 10:51:05.399825783 +0100
+@@ -18,6 +18,31 @@ config SECURITY_DMESG_RESTRICT
+ 
+ 	  If you are unsure how to answer this question, answer N.
+ 
++config GRKERNSEC_SYMLINKOWN
++	bool "Kernel-enforced SymlinksIfOwnerMatch"
++	default y if GRKERNSEC_CONFIG_AUTO && GRKERNSEC_CONFIG_SERVER
++	help
++	  Apache's SymlinksIfOwnerMatch option has an inherent race condition
++	  that prevents it from being used as a security feature.  As Apache
++	  verifies the symlink by performing a stat() against the target of
++	  the symlink before it is followed, an attacker can setup a symlink
++	  to point to a same-owned file, then replace the symlink with one
++	  that targets another user's file just after Apache "validates" the
++	  symlink -- a classic TOCTOU race.  If you say Y here, a complete,
++	  race-free replacement for Apache's "SymlinksIfOwnerMatch" option
++	  will be in place for the group you specify. If the sysctl option
++	  is enabled, a sysctl option with name "enforce_symlinksifowner" is
++	  created.
++
++config GRKERNSEC_SYMLINKOWN_GID
++	int "GID for users with kernel-enforced SymlinksIfOwnerMatch"
++	depends on GRKERNSEC_SYMLINKOWN
++	default 1006
++	help
++	  Setting this GID determines what group kernel-enforced
++	  SymlinksIfOwnerMatch will be enabled for.  If the sysctl option
++	  is enabled, a sysctl option with name "symlinkown_gid" is created.
++
+ config SECURITY
+ 	bool "Enable different security models"
+ 	depends on SYSFS
+@@ -236,6 +261,8 @@ source security/tomoyo/Kconfig
+ source security/apparmor/Kconfig
+ source security/loadpin/Kconfig
+ source security/yama/Kconfig
++source security/sara/Kconfig
++source security/tpe/Kconfig
+ 
+ source security/integrity/Kconfig
+ 
+diff -Nurp a/security/Makefile b/security/Makefile
+--- a/security/Makefile	2018-11-13 20:09:00.000000000 +0100
++++ b/security/Makefile	2018-11-20 10:51:05.399825783 +0100
+@@ -10,6 +10,8 @@ subdir-$(CONFIG_SECURITY_TOMOYO)
+ subdir-$(CONFIG_SECURITY_APPARMOR)	+= apparmor
+ subdir-$(CONFIG_SECURITY_YAMA)		+= yama
+ subdir-$(CONFIG_SECURITY_LOADPIN)	+= loadpin
++subdir-$(CONFIG_SECURITY_SARA)		+= sara
++subdir-$(CONFIG_SECURITY_TPE)		+= tpe
+ 
+ # always enable default capabilities
+ obj-y					+= commoncap.o
+@@ -25,6 +27,8 @@ obj-$(CONFIG_SECURITY_TOMOYO)		+= tomoyo
+ obj-$(CONFIG_SECURITY_APPARMOR)		+= apparmor/
+ obj-$(CONFIG_SECURITY_YAMA)		+= yama/
+ obj-$(CONFIG_SECURITY_LOADPIN)		+= loadpin/
++obj-$(CONFIG_SECURITY_SARA)		+= sara/
++obj-$(CONFIG_SECURITY_TPE)		+= tpe/
+ obj-$(CONFIG_CGROUP_DEVICE)		+= device_cgroup.o
+ 
+ # Object integrity file lists
+diff -Nurp a/security/sara/include/emutramp.h b/security/sara/include/emutramp.h
+--- a/security/sara/include/emutramp.h	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/include/emutramp.h	2018-11-20 10:51:05.399825783 +0100
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * Assembly sequences used here were copied from
++ * PaX patch by PaX Team <pageexec@freemail.hu>
++ * Being just hexadecimal constants, they are not subject to
++ * any copyright.
++ *
++ */
++
++#ifndef __EMUTRAMP_H
++#define __EMUTRAMP_H
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP
++int sara_trampoline_emulator(struct pt_regs *regs,
++			     unsigned long error_code,
++			     unsigned long address);
++#else
++inline int sara_trampoline_emulator(struct pt_regs *regs,
++				    unsigned long error_code,
++				    unsigned long address)
++{
++	return 0;
++}
++#endif /* CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP */
++
++#endif /* __EMUTRAMP_H */
+diff -Nurp a/security/sara/include/sara_data.h b/security/sara/include/sara_data.h
+--- a/security/sara/include/sara_data.h	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/include/sara_data.h	2018-11-20 10:51:05.399825783 +0100
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef __SARA_DATA_H
++#define __SARA_DATA_H
++
++#include <linux/fs.h>
++#include <linux/init.h>
++#include <linux/spinlock.h>
++
++int sara_data_init(void) __init;
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT
++
++struct sara_data {
++	unsigned long	relro_page;
++	struct file	*relro_file;
++	u16		wxp_flags;
++	u16		execve_flags;
++	bool		relro_page_found;
++	bool		mmap_blocked;
++};
++
++struct sara_shm_data {
++	bool		no_exec;
++	bool		no_write;
++	spinlock_t	lock;
++};
++
++struct sara_inode_data {
++	struct task_struct *task;
++};
++
++#define get_sara_data_leftvalue(X) ((X)->security_sara)
++#define get_sara_data(X) ((struct sara_data *) (X)->security_sara)
++#define get_current_sara_data() get_sara_data(current_cred())
++
++#define get_sara_wxp_flags(X) (get_sara_data((X))->wxp_flags)
++#define get_current_sara_wxp_flags() get_sara_wxp_flags(current_cred())
++
++#define get_sara_execve_flags(X) (get_sara_data((X))->execve_flags)
++#define get_current_sara_execve_flags() get_sara_execve_flags(current_cred())
++
++#define get_sara_relro_page(X) (get_sara_data((X))->relro_page)
++#define get_current_sara_relro_page() get_sara_relro_page(current_cred())
++
++#define get_sara_relro_file(X) (get_sara_data((X))->relro_file)
++#define get_current_sara_relro_file() get_sara_relro_file(current_cred())
++
++#define get_sara_relro_page_found(X) (get_sara_data((X))->relro_page_found)
++#define get_current_sara_relro_page_found() \
++	get_sara_relro_page_found(current_cred())
++
++#define get_sara_mmap_blocked(X) (get_sara_data((X))->mmap_blocked)
++#define get_current_sara_mmap_blocked() get_sara_mmap_blocked(current_cred())
++
++#define get_sara_shm_data(X) ((struct sara_shm_data *) (X)->security_sara)
++#define get_sara_shm_no_exec(X) (get_sara_shm_data((X))->no_exec)
++#define get_sara_shm_no_write(X) (get_sara_shm_data((X))->no_write)
++#define lock_sara_shm(X) (spin_lock(&get_sara_shm_data((X))->lock))
++#define unlock_sara_shm(X) (spin_unlock(&get_sara_shm_data((X))->lock))
++
++#define get_sara_inode_data(X) ((struct sara_inode_data *) (X)->security_sara)
++#define get_sara_inode_task(X) (get_sara_inode_data((X))->task)
++
++#endif
++
++#endif /* __SARA_H */
+diff -Nurp a/security/sara/include/sara.h b/security/sara/include/sara.h
+--- a/security/sara/include/sara.h	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/include/sara.h	2018-11-20 10:51:05.399825783 +0100
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef __SARA_H
++#define __SARA_H
++
++#include <linux/types.h>
++#include <uapi/linux/limits.h>
++
++#define SARA_VERSION 0
++#define SARA_PATH_MAX PATH_MAX
++
++#undef pr_fmt
++#define pr_fmt(fmt) "SARA: " fmt
++
++extern bool sara_config_locked __read_mostly;
++extern bool sara_enabled __read_mostly;
++
++void sara_init(void) __init;
++
++#endif /* __SARA_H */
+diff -Nurp a/security/sara/include/securityfs.h b/security/sara/include/securityfs.h
+--- a/security/sara/include/securityfs.h	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/include/securityfs.h	2018-11-20 10:51:05.399825783 +0100
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef __SARA_SECURITYFS_H
++#define __SARA_SECURITYFS_H
++
++#include <linux/init.h>
++
++#define SARA_SUBTREE_NN_LEN 24
++#define SARA_CONFIG_HASH_LEN 20
++
++struct sara_secfs_node;
++
++int sara_secfs_init(void) __init;
++int sara_secfs_subtree_register(const char *subtree_name,
++				const struct sara_secfs_node *nodes,
++				size_t size) __init;
++
++enum sara_secfs_node_type {
++	SARA_SECFS_BOOL,
++	SARA_SECFS_READONLY_INT,
++	SARA_SECFS_CONFIG_LOAD,
++	SARA_SECFS_CONFIG_DUMP,
++	SARA_SECFS_CONFIG_HASH,
++};
++
++struct sara_secfs_node {
++	const enum sara_secfs_node_type type;
++	void *const data;
++	const size_t dir_contents_len;
++	const char name[SARA_SUBTREE_NN_LEN];
++};
++
++struct sara_secfs_fptrs {
++	int (*const load)(const char *, size_t);
++	ssize_t (*const dump)(char **);
++	int (*const hash)(char **);
++};
++
++struct sara_secfs_bool_flag {
++	const char notice_line[SARA_SUBTREE_NN_LEN];
++	bool *const flag;
++};
++
++#define DEFINE_SARA_SECFS_BOOL_FLAG(NAME, VAR)		\
++const struct sara_secfs_bool_flag NAME = {		\
++	.notice_line = #VAR,				\
++	.flag = &VAR,					\
++}
++
++#endif /* __SARA_SECURITYFS_H */
+diff -Nurp a/security/sara/include/utils.h b/security/sara/include/utils.h
+--- a/security/sara/include/utils.h	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/include/utils.h	2018-11-20 10:51:05.399825783 +0100
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef __SARA_UTILS_H
++#define __SARA_UTILS_H
++
++#include <linux/kref.h>
++#include <linux/rcupdate.h>
++#include <linux/spinlock.h>
++
++char *get_absolute_path(const struct path *spath, char **buf);
++char *get_current_path(char **buf);
++
++static inline void release_entry(struct kref *ref)
++{
++	/* All work is done after the return from kref_put(). */
++}
++
++
++/*
++ * The following macros must be used to access S.A.R.A. configuration
++ * structures.
++ * They are thread-safe under the assumption that a configuration
++ * won't ever be deleted but just replaced using SARA_CONFIG_REPLACE,
++ * possibly using an empty configuration.
++ * i.e. every call to SARA_CONFIG_PUT *must* be preceded by a matching
++ * SARA_CONFIG_GET invocation.
++ */
++
++#define SARA_CONFIG_GET_RCU(DEST, CONFIG) do {	\
++	rcu_read_lock();			\
++	DEST = rcu_dereference(CONFIG);		\
++} while (0)
++
++#define SARA_CONFIG_PUT_RCU(DATA) do {		\
++	rcu_read_unlock();			\
++	DATA = NULL;				\
++} while (0)
++
++#define SARA_CONFIG_GET(DEST, CONFIG) do {				\
++	rcu_read_lock();						\
++	do {								\
++		DEST = rcu_dereference(CONFIG);				\
++	} while (DEST && !kref_get_unless_zero(&DEST->refcount));	\
++	rcu_read_unlock();						\
++} while (0)
++
++#define SARA_CONFIG_PUT(DATA, FREE) do {		\
++	if (kref_put(&DATA->refcount, release_entry)) {	\
++		synchronize_rcu();			\
++		FREE(DATA);				\
++	}						\
++	DATA = NULL;					\
++} while (0)
++
++#define SARA_CONFIG_REPLACE(CONFIG, NEW, FREE, LOCK) do {	\
++	typeof(NEW) tmp;					\
++	spin_lock(LOCK);					\
++	tmp = rcu_dereference_protected(CONFIG,			\
++					lockdep_is_held(LOCK));	\
++	rcu_assign_pointer(CONFIG, NEW);			\
++	if (kref_put(&tmp->refcount, release_entry)) {		\
++		spin_unlock(LOCK);				\
++		synchronize_rcu();				\
++		FREE(tmp);					\
++	} else							\
++		spin_unlock(LOCK);				\
++} while (0)
++
++#endif /* __SARA_UTILS_H */
+diff -Nurp a/security/sara/include/wxprot.h b/security/sara/include/wxprot.h
+--- a/security/sara/include/wxprot.h	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/include/wxprot.h	2018-11-20 10:51:05.399825783 +0100
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifndef __SARA_WXPROT_H
++#define __SARA_WXPROT_H
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT
++
++#include <linux/init.h>
++int sara_wxprot_init(void) __init;
++
++#else /* CONFIG_SECURITY_SARA_WXPROT */
++inline int sara_wxprot_init(void)
++{
++	return 0;
++}
++#endif /* CONFIG_SECURITY_SARA_WXPROT */
++
++#endif /* __SARA_WXPROT_H */
+diff -Nurp a/security/sara/Kconfig b/security/sara/Kconfig
+--- a/security/sara/Kconfig	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/Kconfig	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,154 @@
++menuconfig SECURITY_SARA
++	bool "S.A.R.A."
++	depends on SECURITY
++	select SECURITYFS
++	default n
++	help
++	  This selects S.A.R.A. LSM which aims to collect heterogeneous
++	  security measures providing a common interface to manage them.
++	  This LSM will always be stacked with the selected primary LSM and
++	  other stacked LSMs.
++	  Further information can be found in
++	  Documentation/admin-guide/LSM/SARA.rst.
++
++	  If unsure, answer N.
++
++config SECURITY_SARA_DEFAULT_DISABLED
++	bool "S.A.R.A. will be disabled at boot."
++	depends on SECURITY_SARA
++	default n
++	help
++	  If you say Y here, S.A.R.A. will not be enabled at startup. You can
++	  override this option at boot time via "sara.enabled=[1|0]" kernel
++	  parameter or via user-space utilities.
++	  This option is useful for distro kernels.
++
++	  If unsure, answer N.
++
++config SECURITY_SARA_NO_RUNTIME_ENABLE
++	bool "S.A.R.A. can be turn on only at boot time."
++	depends on SECURITY_SARA_DEFAULT_DISABLED
++	default y
++	help
++	  By enabling this option it won't be possible to turn on S.A.R.A.
++	  at runtime via user-space utilities. However it can still be
++	  turned on at boot time via the "sara.enabled=1" kernel parameter.
++	  This option is functionally equivalent to "sara.enabled=0" kernel
++	  parameter. This option is useful for distro kernels.
++
++	  If unsure, answer Y.
++
++config SECURITY_SARA_WXPROT
++	bool "WX Protection: W^X and W!->X protections"
++	depends on SECURITY_SARA
++	default y
++	help
++	  WX Protection aims to improve user-space programs security by applying:
++	    - W^X memory restriction
++	    - W!->X (once writable never executable) mprotect restriction
++	    - Executable MMAP prevention
++	  See Documentation/admin-guide/LSM/SARA.rst. for further information.
++
++	  If unsure, answer Y.
++
++choice
++	prompt "Default action for W^X and W!->X protections"
++	depends on SECURITY_SARA
++	depends on SECURITY_SARA_WXPROT
++	default SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_COMPLAIN_VERBOSE
++
++        help
++	  Choose the default behaviour of WX Protection when no config
++	  rule matches or no rule is loaded.
++	  For further information on available flags and their meaning
++	  see Documentation/admin-guide/LSM/SARA.rst.
++
++	config SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_COMPLAIN_VERBOSE
++		bool "Protections enabled but not enforced."
++		help
++		  All features enabled except "Executable MMAP prevention",
++		  verbose reporting, but no actual enforce: it just complains.
++		  Its numeric value is 0x3f, for more information see
++		  Documentation/admin-guide/LSM/SARA.rst.
++
++        config SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_ENFORCE_VERBOSE
++		bool "Full protection, verbose."
++		help
++		  All features enabled except "Executable MMAP prevention".
++		  The enabled features will be enforced with verbose reporting.
++		  Its numeric value is 0x2f, for more information see
++		  Documentation/admin-guide/LSM/SARA.rst.
++
++        config SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_ENFORCE
++		bool "Full protection, quiet."
++		help
++		  All features enabled except "Executable MMAP prevention".
++		  The enabled features will be enforced quietly.
++		  Its numeric value is 0xf, for more information see
++		  Documentation/admin-guide/LSM/SARA.rst.
++
++	config SECURITY_SARA_WXPROT_DEFAULT_FLAGS_NONE
++		bool "No protection at all."
++		help
++		  All features disabled.
++		  Its numeric value is 0, for more information see
++		  Documentation/admin-guide/LSM/SARA.rst.
++endchoice
++
++config SECURITY_SARA_WXPROT_EMUTRAMP
++	bool "Enable emulation for some types of trampolines"
++	depends on SECURITY_SARA_WXPROT
++	depends on ARCH_HAS_LSM_PAGEFAULT
++	depends on X86
++	default y
++	help
++	  Some programs and libraries need to execute special small code
++	  snippets from non-executable memory pages.
++	  Most notable examples are the GCC and libffi trampolines.
++	  This features make it possible to execute those trampolines even
++	  if they reside in non-executable memory pages.
++	  This features need to be enabled on a per-executable basis
++	  via user-space utilities.
++	  See Documentation/admin-guide/LSM/SARA.rst. for further information.
++
++	  If unsure, answer y.
++
++config SECURITY_SARA_WXPROT_XATTRS_ENABLED
++	bool "xattrs support enabled by default."
++	depends on SECURITY_SARA_WXPROT
++	default n
++	help
++	  If you say Y here it will be possible to override WX protection
++	  configuration via extended attributes in the security namespace.
++	  Even when S.A.R.A.'s configuration has been locked.
++
++	  If unsure, answer N.
++
++config CONFIG_SECURITY_SARA_WXPROT_XATTRS_USER
++	bool "'user' namespace xattrs support enabled by default."
++	depends on SECURITY_SARA_WXPROT_XATTRS_ENABLED
++	default n
++	help
++	  If you say Y here it will be possible to override WX protection
++	  configuration via extended attributes in the user namespace.
++	  Even when S.A.R.A.'s configuration has been locked.
++
++	  If unsure, answer N.
++
++config SECURITY_SARA_WXPROT_DISABLED
++	bool "WX protection will be disabled at boot."
++	depends on SECURITY_SARA_WXPROT
++	default n
++	help
++	  If you say Y here WX protection won't be enabled at startup. You can
++	  override this option via user-space utilities or at boot time via
++	  "sara.wxprot_enabled=[0|1]" kernel parameter.
++
++	  If unsure, answer N.
++
++config SECURITY_SARA_WXPROT_DEFAULT_FLAGS
++	hex
++	default "0x3f" if SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_COMPLAIN_VERBOSE
++	default "0x2f" if SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_ENFORCE_VERBOSE
++	default "0xf" if SECURITY_SARA_WXPROT_DEFAULT_FLAGS_ALL_ENFORCE
++	default "0" if SECURITY_SARA_WXPROT_DEFAULT_FLAGS_NONE
+diff -Nurp a/security/sara/main.c b/security/sara/main.c
+--- a/security/sara/main.c	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/main.c	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,119 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/bug.h>
++#include <linux/kernel.h>
++#include <linux/printk.h>
++#include <linux/module.h>
++
++#include "include/sara.h"
++#include "include/sara_data.h"
++#include "include/securityfs.h"
++#include "include/wxprot.h"
++
++static const int sara_version = SARA_VERSION;
++
++#ifdef CONFIG_SECURITY_SARA_NO_RUNTIME_ENABLE
++bool sara_config_locked __read_mostly = true;
++#else
++bool sara_config_locked __read_mostly;
++#endif
++
++#ifdef CONFIG_SECURITY_SARA_DEFAULT_DISABLED
++bool sara_enabled __read_mostly;
++#else
++bool sara_enabled __read_mostly = true;
++#endif
++
++static DEFINE_SARA_SECFS_BOOL_FLAG(sara_enabled_data, sara_enabled);
++static DEFINE_SARA_SECFS_BOOL_FLAG(sara_config_locked_data, sara_config_locked);
++
++static int param_set_senabled(const char *val, const struct kernel_param *kp)
++{
++	if (!val)
++		return 0;
++	if (strtobool(val, kp->arg))
++		return -EINVAL;
++	/* config must by locked when S.A.R.A. is disabled at boot
++	 * and unlocked when it's enabled
++	 */
++	sara_config_locked = !(*(bool *) kp->arg);
++	return 0;
++}
++
++static struct kernel_param_ops param_ops_senabled = {
++	.set = param_set_senabled,
++};
++
++#define param_check_senabled(name, p) __param_check(name, p, bool)
++
++module_param_named(enabled, sara_enabled, senabled, 0000);
++MODULE_PARM_DESC(enabled, "Disable or enable S.A.R.A. at boot time. If disabled this way S.A.R.A. can't be enabled again.");
++
++static const struct sara_secfs_node main_fs[] __initconst = {
++	{
++		.name = "enabled",
++		.type = SARA_SECFS_BOOL,
++		.data = (void *) &sara_enabled_data,
++	},
++	{
++		.name = "locked",
++		.type = SARA_SECFS_BOOL,
++		.data = (void *) &sara_config_locked_data,
++	},
++	{
++		.name = "version",
++		.type = SARA_SECFS_READONLY_INT,
++		.data = (int *) &sara_version,
++	},
++};
++
++void __init sara_init(void)
++{
++	if (!sara_enabled && sara_config_locked) {
++		pr_notice("permanently disabled.\n");
++		return;
++	}
++
++	pr_debug("initializing...\n");
++
++	if (sara_secfs_subtree_register("main",
++					main_fs,
++					ARRAY_SIZE(main_fs))) {
++		pr_crit("impossible to register main fs.\n");
++		goto error;
++	}
++
++	if (sara_data_init()) {
++		pr_crit("impossible to initialize creds.\n");
++		goto error;
++	}
++
++	if (sara_wxprot_init()) {
++		pr_crit("impossible to initialize WX protections.\n");
++		goto error;
++	}
++
++	pr_debug("initialized.\n");
++
++	if (sara_enabled)
++		pr_info("enabled\n");
++	else
++		pr_notice("disabled\n");
++	return;
++
++error:
++	sara_enabled = false;
++	sara_config_locked = true;
++	pr_crit("permanently disabled.\n");
++}
+diff -Nurp a/security/sara/Makefile b/security/sara/Makefile
+--- a/security/sara/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/Makefile	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,4 @@
++obj-$(CONFIG_SECURITY_SARA) := sara.o
++
++sara-y := main.o securityfs.o utils.o sara_data.o
++sara-$(CONFIG_SECURITY_SARA_WXPROT) += wxprot.o
+diff -Nurp a/security/sara/sara_data.c b/security/sara/sara_data.c
+--- a/security/sara/sara_data.c	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/sara_data.c	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include "include/sara_data.h"
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT
++#include <linux/cred.h>
++#include <linux/lsm_hooks.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++
++static struct kmem_cache *sara_inode_cache;
++
++static int sara_cred_alloc_blank(struct cred *cred, gfp_t gfp)
++{
++	struct sara_data *d;
++
++	d = kzalloc(sizeof(*d), gfp);
++	if (d == NULL)
++		return -ENOMEM;
++	get_sara_data_leftvalue(cred) = d;
++	return 0;
++}
++
++static void sara_cred_free(struct cred *cred)
++{
++	struct sara_data *d;
++
++	d = get_sara_data(cred);
++	if (d != NULL) {
++		kfree(d);
++		get_sara_data_leftvalue(cred) = NULL;
++	}
++}
++
++static int sara_cred_prepare(struct cred *new, const struct cred *old,
++			     gfp_t gfp)
++{
++	struct sara_data *d;
++
++	d = kmemdup(get_sara_data(old), sizeof(*d), gfp);
++	if (d == NULL)
++		return -ENOMEM;
++	get_sara_data_leftvalue(new) = d;
++	return 0;
++}
++
++static void sara_cred_transfer(struct cred *new, const struct cred *old)
++{
++	*get_sara_data(new) = *get_sara_data(old);
++}
++
++static int sara_shm_alloc_security(struct kern_ipc_perm *shp)
++{
++	struct sara_shm_data *d;
++
++	d = kzalloc(sizeof(*d), GFP_KERNEL);
++	if (d == NULL)
++		return -ENOMEM;
++	spin_lock_init(&d->lock);
++	get_sara_data_leftvalue(shp) = d;
++	return 0;
++}
++
++static void sara_shm_free_security(struct kern_ipc_perm *shp)
++{
++	kfree(get_sara_data_leftvalue(shp));
++}
++
++static int sara_inode_alloc_security(struct inode *inode)
++{
++	struct sara_inode_data *d;
++
++	d = kmem_cache_zalloc(sara_inode_cache, GFP_NOFS);
++	if (d == NULL)
++		return -ENOMEM;
++	get_sara_data_leftvalue(inode) = d;
++	return 0;
++}
++
++static void sara_inode_free_security(struct inode *inode)
++{
++	kmem_cache_free(sara_inode_cache, get_sara_data_leftvalue(inode));
++}
++
++static void sara_task_to_inode(struct task_struct *t, struct inode *i)
++{
++	get_sara_inode_task(i) = t;
++}
++
++static struct security_hook_list data_hooks[] __ro_after_init = {
++	LSM_HOOK_INIT(cred_alloc_blank, sara_cred_alloc_blank),
++	LSM_HOOK_INIT(cred_free, sara_cred_free),
++	LSM_HOOK_INIT(cred_prepare, sara_cred_prepare),
++	LSM_HOOK_INIT(cred_transfer, sara_cred_transfer),
++	LSM_HOOK_INIT(shm_alloc_security, sara_shm_alloc_security),
++	LSM_HOOK_INIT(shm_free_security, sara_shm_free_security),
++	LSM_HOOK_INIT(inode_alloc_security, sara_inode_alloc_security),
++	LSM_HOOK_INIT(inode_free_security, sara_inode_free_security),
++	LSM_HOOK_INIT(task_to_inode, sara_task_to_inode),
++};
++
++int __init sara_data_init(void)
++{
++	int ret;
++
++	sara_inode_cache = KMEM_CACHE(sara_inode_data, 0);
++	if (!sara_inode_cache)
++		return -ENOMEM;
++	ret = sara_cred_alloc_blank((struct cred *) current->real_cred,
++				    GFP_KERNEL);
++	if (ret) {
++		kmem_cache_destroy(sara_inode_cache);
++		return ret;
++	}
++	security_add_hooks(data_hooks, ARRAY_SIZE(data_hooks), "sara");
++	return ret;
++}
++
++#else /* CONFIG_SECURITY_SARA_WXPROT */
++
++int __init sara_data_init(void)
++{
++	return 0;
++}
++
++#endif
+diff -Nurp a/security/sara/securityfs.c b/security/sara/securityfs.c
+--- a/security/sara/securityfs.c	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/securityfs.c	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,565 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/capability.h>
++#include <linux/ctype.h>
++#include <linux/mm.h>
++#include <linux/printk.h>
++#include <linux/security.h>
++#include <linux/seq_file.h>
++#include <linux/spinlock.h>
++#include <linux/uaccess.h>
++
++#include "include/sara.h"
++#include "include/utils.h"
++#include "include/securityfs.h"
++
++#define __SARA_STR_HELPER(x) #x
++#define SARA_STR(x) __SARA_STR_HELPER(x)
++
++static struct dentry *fs_root;
++
++static inline bool check_config_write_access(void)
++{
++	if (unlikely(sara_config_locked)) {
++		pr_warn("config write access blocked.\n");
++		return false;
++	}
++	return true;
++}
++
++static bool check_config_access(const struct file *file)
++{
++	if (!capable(CAP_MAC_ADMIN))
++		return false;
++	if (file->f_flags & O_WRONLY || file->f_flags & O_RDWR)
++		if (unlikely(!check_config_write_access()))
++			return false;
++	return true;
++}
++
++static int file_flag_show(struct seq_file *seq, void *v)
++{
++	bool *flag = ((struct sara_secfs_bool_flag *)seq->private)->flag;
++
++	seq_printf(seq, "%d\n", *flag);
++	return 0;
++}
++
++static ssize_t file_flag_write(struct file *file,
++				const char __user *ubuf,
++				size_t buf_size,
++				loff_t *offset)
++{
++	struct sara_secfs_bool_flag *bool_flag =
++		((struct seq_file *) file->private_data)->private;
++	char kbuf[2] = {'A', '\n'};
++	bool nf;
++
++	if (unlikely(*offset != 0))
++		return -ESPIPE;
++
++	if (unlikely(buf_size != 1 && buf_size != 2))
++		return -EPERM;
++
++	if (unlikely(copy_from_user(kbuf, ubuf, buf_size)))
++		return -EFAULT;
++
++	if (unlikely(kbuf[1] != '\n'))
++		return -EPERM;
++
++	switch (kbuf[0]) {
++	case '0':
++		nf = false;
++		break;
++	case '1':
++		nf = true;
++		break;
++	default:
++		return -EPERM;
++	}
++
++	*bool_flag->flag = nf;
++
++	if (strlen(bool_flag->notice_line) > 0)
++		pr_notice("flag \"%s\" set to %d\n",
++			  bool_flag->notice_line,
++			  nf);
++
++	return buf_size;
++}
++
++static int file_flag_open(struct inode *inode, struct file *file)
++{
++	if (unlikely(!check_config_access(file)))
++		return -EACCES;
++	return single_open(file, file_flag_show, inode->i_private);
++}
++
++static const struct file_operations file_flag = {
++	.owner		= THIS_MODULE,
++	.open		= file_flag_open,
++	.write		= file_flag_write,
++	.read		= seq_read,
++	.release	= single_release,
++};
++
++static int file_readonly_int_show(struct seq_file *seq, void *v)
++{
++	int *flag = seq->private;
++
++	seq_printf(seq, "%d\n", *flag);
++	return 0;
++}
++
++static int file_readonly_int_open(struct inode *inode, struct file *file)
++{
++	if (unlikely(!check_config_access(file)))
++		return -EACCES;
++	return single_open(file, file_readonly_int_show, inode->i_private);
++}
++
++static const struct file_operations file_readonly_int = {
++	.owner		= THIS_MODULE,
++	.open		= file_readonly_int_open,
++	.read		= seq_read,
++	.release	= single_release,
++};
++
++static ssize_t file_config_loader_write(struct file *file,
++					const char __user *ubuf,
++					size_t buf_size,
++					loff_t *offset)
++{
++	const struct sara_secfs_fptrs *fptrs = file->private_data;
++	char *kbuf = NULL;
++	ssize_t ret;
++
++	ret = -ESPIPE;
++	if (unlikely(*offset != 0))
++		goto out;
++
++	ret = -ENOMEM;
++	kbuf = kvmalloc(buf_size, GFP_KERNEL_ACCOUNT);
++	if (unlikely(kbuf == NULL))
++		goto out;
++
++	ret = -EFAULT;
++	if (unlikely(copy_from_user(kbuf, ubuf, buf_size)))
++		goto out;
++
++	ret = fptrs->load(kbuf, buf_size);
++
++	if (unlikely(ret))
++		goto out;
++
++	ret = buf_size;
++
++out:
++	kvfree(kbuf);
++	return ret;
++}
++
++static int file_config_loader_open(struct inode *inode, struct file *file)
++{
++	if (unlikely(!check_config_access(file)))
++		return -EACCES;
++	file->private_data = inode->i_private;
++	return 0;
++}
++
++static const struct file_operations file_config_loader = {
++	.owner		= THIS_MODULE,
++	.open		= file_config_loader_open,
++	.write		= file_config_loader_write,
++};
++
++static int file_config_show(struct seq_file *seq, void *v)
++{
++	const struct sara_secfs_fptrs *fptrs = seq->private;
++	char *buf = NULL;
++	ssize_t ret;
++
++	ret = fptrs->dump(&buf);
++	if (unlikely(ret <= 0))
++		goto out;
++	seq_write(seq, buf, ret);
++	kvfree(buf);
++	ret = 0;
++out:
++	return ret;
++}
++
++static int file_dumper_open(struct inode *inode, struct file *file)
++{
++	if (unlikely(!check_config_access(file)))
++		return -EACCES;
++	return single_open(file, file_config_show, inode->i_private);
++}
++
++static const struct file_operations file_config_dumper = {
++	.owner		= THIS_MODULE,
++	.open		= file_dumper_open,
++	.read		= seq_read,
++	.release	= single_release,
++};
++
++static int file_hash_show(struct seq_file *seq, void *v)
++{
++	const struct sara_secfs_fptrs *fptrs = seq->private;
++	char *buf = NULL;
++	int ret;
++
++	ret = fptrs->hash(&buf);
++	if (unlikely(ret))
++		goto out;
++	seq_printf(seq, "%" SARA_STR(SARA_CONFIG_HASH_LEN) "phN\n", buf);
++	kvfree(buf);
++	ret = 0;
++out:
++	return ret;
++}
++
++static int file_hash_open(struct inode *inode, struct file *file)
++{
++	if (unlikely(!check_config_access(file)))
++		return -EACCES;
++	return single_open(file, file_hash_show, inode->i_private);
++}
++
++static const struct file_operations file_hash = {
++	.owner		= THIS_MODULE,
++	.open		= file_hash_open,
++	.read		= seq_read,
++	.release	= single_release,
++};
++
++static int mk_dir(struct dentry *parent,
++		const char *dir_name,
++		struct dentry **dir_out)
++{
++	int ret = 0;
++
++	*dir_out = securityfs_create_dir(dir_name, parent);
++	if (IS_ERR(*dir_out)) {
++		ret = -PTR_ERR(*dir_out);
++		*dir_out = NULL;
++	}
++	return ret;
++}
++
++static int mk_bool_flag(struct dentry *parent,
++			const char *file_name,
++			struct dentry **dir_out,
++			void *flag)
++{
++	int ret = 0;
++
++	*dir_out = securityfs_create_file(file_name,
++					0600,
++					parent,
++					flag,
++					&file_flag);
++	if (IS_ERR(*dir_out)) {
++		ret = -PTR_ERR(*dir_out);
++		*dir_out = NULL;
++	}
++	return 0;
++}
++
++static int mk_readonly_int(struct dentry *parent,
++			const char *file_name,
++			struct dentry **dir_out,
++			void *readonly_int)
++{
++	int ret = 0;
++
++	*dir_out = securityfs_create_file(file_name,
++					0400,
++					parent,
++					readonly_int,
++					&file_readonly_int);
++	if (IS_ERR(*dir_out)) {
++		ret = -PTR_ERR(*dir_out);
++		*dir_out = NULL;
++	}
++	return 0;
++}
++
++static int mk_config_loader(struct dentry *parent,
++			const char *file_name,
++			struct dentry **dir_out,
++			void *fptrs)
++{
++	int ret = 0;
++
++	*dir_out = securityfs_create_file(file_name,
++					0200,
++					parent,
++					fptrs,
++					&file_config_loader);
++	if (IS_ERR(*dir_out)) {
++		ret = -PTR_ERR(*dir_out);
++		*dir_out = NULL;
++	}
++	return 0;
++}
++
++static int mk_config_dumper(struct dentry *parent,
++				const char *file_name,
++				struct dentry **dir_out,
++				void *fptrs)
++{
++	int ret = 0;
++
++	*dir_out = securityfs_create_file(file_name,
++					0400,
++					parent,
++					fptrs,
++					&file_config_dumper);
++	if (IS_ERR(*dir_out)) {
++		ret = -PTR_ERR(*dir_out);
++		*dir_out = NULL;
++	}
++	return 0;
++}
++
++static int mk_config_hash(struct dentry *parent,
++			const char *file_name,
++			struct dentry **dir_out,
++			void *fptrs)
++{
++	int ret = 0;
++
++	*dir_out = securityfs_create_file(file_name,
++					0400,
++					parent,
++					fptrs,
++					&file_hash);
++	if (IS_ERR(*dir_out)) {
++		ret = -PTR_ERR(*dir_out);
++		*dir_out = NULL;
++	}
++	return 0;
++}
++
++struct sara_secfs_subtree {
++	char name[SARA_SUBTREE_NN_LEN];
++	size_t size;
++	struct dentry **nodes;
++	const struct sara_secfs_node *nodes_description;
++	struct list_head subtree_list;
++};
++
++static LIST_HEAD(subtree_list);
++
++int __init sara_secfs_subtree_register(const char *subtree_name,
++				const struct sara_secfs_node *nodes,
++				size_t size)
++{
++	int ret;
++	struct sara_secfs_subtree *subtree = NULL;
++
++	ret = -EINVAL;
++	if (unlikely(size < 1))
++		goto error;
++	ret = -ENOMEM;
++	subtree = kmalloc(sizeof(*subtree), GFP_KERNEL);
++	if (unlikely(subtree == NULL))
++		goto error;
++	strncpy(subtree->name,
++		subtree_name,
++		sizeof(subtree->name));
++	subtree->name[sizeof(subtree->name)-1] = '\0';
++	subtree->size = size+1;
++	subtree->nodes = kcalloc(subtree->size,
++				sizeof(*subtree->nodes),
++				GFP_KERNEL);
++	if (unlikely(subtree->nodes == NULL))
++		goto error;
++	subtree->nodes_description = nodes;
++	INIT_LIST_HEAD(&subtree->subtree_list);
++	list_add(&subtree->subtree_list, &subtree_list);
++	return 0;
++
++error:
++	kfree(subtree);
++	pr_warn("SECFS: Impossible to register '%s' (%d).\n",
++		subtree_name, ret);
++	return ret;
++}
++
++static inline int __init create_node(enum sara_secfs_node_type type,
++					struct dentry *parent,
++					const char *name,
++					struct dentry **output,
++					void *data)
++{
++	switch (type) {
++	case SARA_SECFS_BOOL:
++		return mk_bool_flag(parent, name, output, data);
++	case SARA_SECFS_READONLY_INT:
++		return mk_readonly_int(parent, name, output, data);
++	case SARA_SECFS_CONFIG_LOAD:
++		return mk_config_loader(parent, name, output, data);
++	case SARA_SECFS_CONFIG_DUMP:
++		return mk_config_dumper(parent, name, output, data);
++	case SARA_SECFS_CONFIG_HASH:
++		return mk_config_hash(parent, name, output, data);
++	default:
++		return -EINVAL;
++	}
++}
++
++static void subtree_unplug(struct sara_secfs_subtree *subtree)
++{
++	int i;
++
++	for (i = 0; i < subtree->size; ++i) {
++		if (subtree->nodes[i] != NULL) {
++			securityfs_remove(subtree->nodes[i]);
++			subtree->nodes[i] = NULL;
++		}
++	}
++}
++
++static int __init subtree_plug(struct sara_secfs_subtree *subtree)
++{
++	int ret;
++	int i;
++	const struct sara_secfs_node *nodes = subtree->nodes_description;
++
++	ret = -EINVAL;
++	if (unlikely(fs_root == NULL))
++		goto out;
++	ret = mk_dir(fs_root,
++			subtree->name,
++			&subtree->nodes[subtree->size-1]);
++	if (unlikely(ret))
++		goto out_unplug;
++	for (i = 0; i < subtree->size-1; ++i) {
++		ret = create_node(nodes[i].type,
++				  subtree->nodes[subtree->size-1],
++				  nodes[i].name,
++				  &subtree->nodes[i],
++				  nodes[i].data);
++		if (unlikely(ret))
++			goto out_unplug;
++	}
++	return 0;
++
++out_unplug:
++	subtree_unplug(subtree);
++out:
++	pr_warn("SECFS: Impossible to plug '%s' (%d).\n", subtree->name, ret);
++	return ret;
++}
++
++static int __init subtree_plug_all(void)
++{
++	int ret;
++	struct list_head *position;
++	struct sara_secfs_subtree *subtree;
++
++	ret = -EINVAL;
++	if (unlikely(fs_root == NULL))
++		goto out;
++	ret = 0;
++	list_for_each(position, &subtree_list) {
++		subtree = list_entry(position,
++					struct sara_secfs_subtree,
++					subtree_list);
++		if (subtree->nodes[0] == NULL) {
++			ret = subtree_plug(subtree);
++			if (unlikely(ret))
++				goto out;
++		}
++	}
++out:
++	if (unlikely(ret))
++		pr_warn("SECFS: Impossible to plug subtrees (%d).\n", ret);
++	return ret;
++}
++
++static void __init subtree_free_all(bool unplug)
++{
++	struct list_head *position;
++	struct list_head *next;
++	struct sara_secfs_subtree *subtree;
++
++	list_for_each_safe(position, next, &subtree_list) {
++		subtree = list_entry(position,
++					struct sara_secfs_subtree,
++					subtree_list);
++		list_del(position);
++		if (unplug)
++			subtree_unplug(subtree);
++		kfree(subtree->nodes);
++		kfree(subtree);
++	}
++}
++
++static int mk_root(void)
++{
++	int ret = -1;
++
++	if (fs_root == NULL)
++		ret = mk_dir(NULL, "sara", &fs_root);
++	if (unlikely(ret || fs_root == NULL))
++		pr_warn("SECFS: Impossible to create root (%d).\n", ret);
++	return ret;
++}
++
++static inline void rm_root(void)
++{
++	if (likely(fs_root != NULL)) {
++		securityfs_remove(fs_root);
++		fs_root = NULL;
++	}
++}
++
++static inline void __init sara_secfs_destroy(void)
++{
++	subtree_free_all(true);
++	rm_root();
++}
++
++int __init sara_secfs_init(void)
++{
++	int ret;
++
++	if (!sara_enabled && sara_config_locked)
++		return 0;
++
++	fs_root = NULL;
++
++	ret = mk_root();
++	if (unlikely(ret))
++		goto error;
++
++	ret = subtree_plug_all();
++	if (unlikely(ret))
++		goto error;
++
++	subtree_free_all(false);
++
++	pr_debug("securityfs initilaized.\n");
++	return 0;
++
++error:
++	sara_secfs_destroy();
++	pr_crit("impossible to build securityfs.\n");
++	return ret;
++}
++
++fs_initcall(sara_secfs_init);
+diff -Nurp a/security/sara/utils.c b/security/sara/utils.c
+--- a/security/sara/utils.c	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/utils.c	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/dcache.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++
++#include "include/sara.h"
++#include "include/utils.h"
++
++/**
++ * get_absolute_path - return the absolute path for a struct path
++ * @spath: the struct path to report
++ * @buf: double pointer where the newly allocated buffer will be placed
++ *
++ * Returns a pointer into @buf or an error code.
++ *
++ * The caller MUST kvfree @buf when finished using it.
++ */
++char *get_absolute_path(const struct path *spath, char **buf)
++{
++	size_t size = 128;
++	char *work_buf = NULL;
++	char *path = NULL;
++
++	do {
++		kvfree(work_buf);
++		work_buf = NULL;
++		if (size > SARA_PATH_MAX) {
++			path = ERR_PTR(-ENAMETOOLONG);
++			goto error;
++		}
++		work_buf = kvmalloc(size, GFP_KERNEL);
++		if (unlikely(work_buf == NULL)) {
++			path = ERR_PTR(-ENOMEM);
++			goto error;
++		}
++		path = d_absolute_path(spath, work_buf, size);
++		size *= 2;
++	} while (PTR_ERR(path) == -ENAMETOOLONG);
++	if (!IS_ERR(path))
++		goto out;
++
++error:
++	kvfree(work_buf);
++	work_buf = NULL;
++out:
++	*buf = work_buf;
++	return path;
++}
++
++/**
++ * get_current_path - return the absolute path for the exe_file
++ *		      in the current task_struct, falling back
++ *		      to the contents of the comm field.
++ * @buf: double pointer where the newly allocated buffer will be placed
++ *
++ * Returns a pointer into @buf or an error code.
++ *
++ * The caller MUST kvfree @buf when finished using it.
++ */
++char *get_current_path(char **buf)
++{
++	struct file *exe_file;
++	char *path = NULL;
++
++	exe_file = get_task_exe_file(current);
++	if (exe_file) {
++		path = get_absolute_path(&exe_file->f_path, buf);
++		fput(exe_file);
++	}
++	if (IS_ERR_OR_NULL(path)) {
++		*buf = kzalloc(TASK_COMM_LEN, GFP_KERNEL);
++		__get_task_comm(*buf, TASK_COMM_LEN, current);
++		path = *buf;
++	}
++	return path;
++}
+diff -Nurp a/security/sara/wxprot.c b/security/sara/wxprot.c
+--- a/security/sara/wxprot.c	1970-01-01 01:00:00.000000000 +0100
++++ b/security/sara/wxprot.c	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,1152 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * S.A.R.A. Linux Security Module
++ *
++ * Copyright (C) 2017 Salvatore Mesoraca <s.mesoraca16@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT
++
++#include <linux/binfmts.h>
++#include <linux/capability.h>
++#include <linux/cred.h>
++#include <linux/elf.h>
++#include <linux/kref.h>
++#include <linux/lsm_hooks.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/module.h>
++#include <linux/mount.h>
++#include <linux/printk.h>
++#include <linux/ratelimit.h>
++#include <linux/sched/mm.h>
++#include <linux/sched/task.h>
++#include <linux/spinlock.h>
++#include <linux/xattr.h>
++
++#include "include/sara.h"
++#include "include/sara_data.h"
++#include "include/utils.h"
++#include "include/securityfs.h"
++#include "include/wxprot.h"
++#include "include/emutramp.h"
++
++#define SARA_WXPROT_CONFIG_VERSION 0
++
++#define SARA_WXP_HEAP		0x0001
++#define SARA_WXP_STACK		0x0002
++#define SARA_WXP_OTHER		0x0004
++#define SARA_WXP_WXORX		0x0008
++#define SARA_WXP_COMPLAIN	0x0010
++#define SARA_WXP_VERBOSE	0x0020
++#define SARA_WXP_MMAP		0x0040
++#define SARA_WXP_FORCE_WXORX	0x0080
++#define SARA_WXP_EMUTRAMP	0x0100
++#define SARA_WXP_TRANSFER	0x0200
++#define SARA_WXP_NONE		0x0000
++#define SARA_WXP_MPROTECT	(SARA_WXP_HEAP	| \
++				 SARA_WXP_STACK	| \
++				 SARA_WXP_OTHER)
++#define __SARA_WXP_ALL		(SARA_WXP_MPROTECT	| \
++				 SARA_WXP_MMAP		| \
++				 SARA_WXP_WXORX		| \
++				 SARA_WXP_COMPLAIN	| \
++				 SARA_WXP_VERBOSE)
++#ifdef CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP
++#define SARA_WXP_ALL		(__SARA_WXP_ALL		| \
++				 SARA_WXP_EMUTRAMP)
++#else /* CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP */
++#define SARA_WXP_ALL		__SARA_WXP_ALL
++#endif /* CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP */
++
++struct wxprot_rule {
++	char *path;
++	u16 flags;
++	bool exact;
++};
++
++struct wxprot_config_container {
++	u32 rules_size;
++	struct wxprot_rule *rules;
++	size_t buf_len;
++	struct kref refcount;
++	char hash[SARA_CONFIG_HASH_LEN];
++};
++
++static struct wxprot_config_container __rcu *wxprot_config;
++
++static const int wxprot_config_version = SARA_WXPROT_CONFIG_VERSION;
++static bool wxprot_enabled __read_mostly = true;
++static DEFINE_SPINLOCK(wxprot_config_lock);
++
++static u16 default_flags __ro_after_init =
++				CONFIG_SECURITY_SARA_WXPROT_DEFAULT_FLAGS;
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP
++static const bool wxprot_emutramp = true;
++#else
++static const bool wxprot_emutramp;
++#endif
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT_XATTRS_ENABLED
++static bool wxprot_xattrs_enabled __read_mostly = true;
++#else
++static bool wxprot_xattrs_enabled __read_mostly;
++#endif
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT_XATTRS_USER
++static bool wxprot_xattrs_user __read_mostly = true;
++#else
++static bool wxprot_xattrs_user __read_mostly;
++#endif
++
++static void pr_wxp(char *msg)
++{
++	char *buf, *path;
++
++	path = get_current_path(&buf);
++	pr_notice_ratelimited("WXP: %s in '%s' (%d).\n",
++			      msg, path, current->pid);
++	kvfree(buf);
++}
++
++/**
++ * are_flags_valid - check whether the given combination of flags is valid
++ * @flags: the flags to be checked
++ *
++ * Returns true if flags are valid, false otherwise.
++ *
++ * Rules checked:
++ *   - Unused bits must be set to 0.
++ *   - Any feature in the "MPROTECT" group require "WXORX".
++ *   - "COMPLAIN" and "VERBOSE" can only be used if some other feature is
++ *     enabled.
++ *   - Trampoline emulation can only be used when all "MPROTECT"
++ *     features are active.
++ *   - "MMAP" protection requires SARA_WXP_OTHER
++ */
++static bool are_flags_valid(u16 flags)
++{
++	flags &= ~SARA_WXP_TRANSFER;
++	if (unlikely((flags & SARA_WXP_ALL) != flags))
++		return false;
++	if (unlikely(flags & SARA_WXP_MPROTECT &&
++		     !(flags & SARA_WXP_WXORX)))
++		return false;
++	if (unlikely(flags & (SARA_WXP_COMPLAIN | SARA_WXP_VERBOSE) &&
++		     !(flags & (SARA_WXP_MPROTECT |
++				SARA_WXP_WXORX |
++				SARA_WXP_MMAP))))
++		return false;
++	if (unlikely(flags & SARA_WXP_MMAP &&
++		     !(flags & SARA_WXP_OTHER)))
++		return false;
++	if (unlikely(flags & SARA_WXP_EMUTRAMP &&
++		     ((flags & SARA_WXP_MPROTECT) != SARA_WXP_MPROTECT)))
++		return false;
++	return true;
++}
++
++module_param(wxprot_enabled, bool, 0);
++MODULE_PARM_DESC(wxprot_enabled,
++		 "Disable or enable S.A.R.A. WX Protection at boot time.");
++
++module_param(wxprot_xattrs_enabled, bool, 0);
++MODULE_PARM_DESC(wxprot_xattrs_enabled,
++		 "Disable or enable S.A.R.A. WXP extended attributes interfaces.");
++
++module_param(wxprot_xattrs_user, bool, 0);
++MODULE_PARM_DESC(wxprot_xattrs_user,
++		 "Allow normal users to override S.A.R.A. WXP settings via extended attributes.");
++
++static int param_set_wxpflags(const char *val, const struct kernel_param *kp)
++{
++	u16 flags;
++
++	if (!val || kstrtou16(val, 0, &flags) != 0 || !are_flags_valid(flags))
++		return -EINVAL;
++	*(u16 *) kp->arg = flags;
++	return 0;
++}
++
++static struct kernel_param_ops param_ops_wxpflags = {
++	.set = param_set_wxpflags,
++};
++
++#define param_check_wxpflags(name, p) __param_check(name, p, u16)
++
++module_param_named(wxprot_default_flags, default_flags, wxpflags, 0);
++MODULE_PARM_DESC(wxprot_default_flags,
++		 "Disable or enable S.A.R.A. WX Protection at boot time.");
++
++/*
++ * MMAP exec restriction
++ */
++#define PT_GNU_RELRO (PT_LOOS + 0x474e552)
++
++union elfh {
++	struct elf32_hdr c32;
++	struct elf64_hdr c64;
++};
++
++union elfp {
++	struct elf32_phdr c32;
++	struct elf64_phdr c64;
++};
++
++#define find_relro_section(ELFH, ELFP, FILE, RELRO, FOUND) do {		\
++	unsigned long i;						\
++	int _tmp;							\
++	loff_t _pos = 0;						\
++	if (ELFH.e_type == ET_DYN || ELFH.e_type == ET_EXEC) {		\
++		for (i = 0; i < ELFH.e_phnum; ++i) {			\
++			_pos = ELFH.e_phoff + i*sizeof(ELFP);		\
++			_tmp = kernel_read(FILE, &ELFP, sizeof(ELFP),	\
++					   &_pos);			\
++			if (_tmp != sizeof(ELFP))			\
++				break;					\
++			if (ELFP.p_type == PT_GNU_RELRO) {		\
++				RELRO = ELFP.p_offset >> PAGE_SHIFT;	\
++				FOUND = true;				\
++				break;					\
++			}						\
++		}							\
++	}								\
++} while (0)
++
++static int set_relro_page(struct linux_binprm *bprm)
++{
++	union elfh elf_h;
++	union elfp elf_p;
++	unsigned long relro_page = 0;
++	bool relro_page_found = false;
++	int ret;
++	loff_t pos = 0;
++
++	ret = kernel_read(bprm->file, &elf_h, sizeof(elf_h), &pos);
++	if (ret == sizeof(elf_h) &&
++	    strncmp(elf_h.c32.e_ident, ELFMAG, SELFMAG) == 0) {
++		if (elf_h.c32.e_ident[EI_CLASS] == ELFCLASS32) {
++			find_relro_section(elf_h.c32,
++					   elf_p.c32,
++					   bprm->file,
++					   relro_page,
++					   relro_page_found);
++		} else if (IS_ENABLED(CONFIG_64BIT) &&
++			   elf_h.c64.e_ident[EI_CLASS] == ELFCLASS64) {
++			find_relro_section(elf_h.c64,
++					   elf_p.c64,
++					   bprm->file,
++					   relro_page,
++					   relro_page_found);
++		}
++	} else
++		return 2; /* It isn't an ELF */
++
++	if (relro_page_found) {
++		get_sara_relro_page(bprm->cred) = relro_page;
++		get_sara_relro_page_found(bprm->cred) = relro_page_found;
++		get_sara_relro_file(bprm->cred) = bprm->file;
++		return 0;
++	} else
++		return 1; /* It's an ELF without a RELRO section */
++}
++
++static inline int is_relro_page(const struct vm_area_struct *vma)
++{
++	if (get_current_sara_relro_page_found() &&
++	    get_current_sara_relro_page() == vma->vm_pgoff &&
++	    get_current_sara_relro_file() == vma->vm_file)
++		return 1;
++	return 0;
++}
++
++/*
++ * Extended attributes handling
++ */
++static int sara_wxprot_xattrs_name(struct dentry *d,
++				   const char *name,
++				   u16 *flags)
++{
++	int rc;
++	char buffer[10];
++	u16 tmp;
++
++	if (!(d->d_inode->i_opflags & IOP_XATTR))
++		return -EOPNOTSUPP;
++
++	rc = __vfs_getxattr(d, d->d_inode, name, buffer, sizeof(buffer) - 1);
++	if (rc > 0) {
++		buffer[rc] = '\0';
++		rc = kstrtou16(buffer, 0, &tmp);
++		if (rc)
++			return rc;
++		if (!are_flags_valid(tmp))
++			return -EINVAL;
++		*flags = tmp;
++		return 0;
++	} else if (rc < 0)
++		return rc;
++
++	return -ENODATA;
++}
++
++#define sara_xattrs_may_return(RC, XATTRNAME, FNAME) do {	\
++	if (RC == -EINVAL || RC == -ERANGE)			\
++		pr_info_ratelimited(				\
++			"WXP: malformed xattr '%s' on '%s'\n",	\
++			XATTRNAME,				\
++			FNAME);					\
++	else if (RC == 0)					\
++		return 0;					\
++} while (0)
++
++static inline int sara_wxprot_xattrs(struct dentry *d,
++				     u16 *flags)
++{
++	int rc;
++
++	if (!wxprot_xattrs_enabled)
++		return 1;
++	if (wxprot_xattrs_user) {
++		rc = sara_wxprot_xattrs_name(d, XATTR_NAME_USR_SARA_WXP,
++					     flags);
++		sara_xattrs_may_return(rc, XATTR_NAME_USR_SARA_WXP,
++				       d->d_name.name);
++	}
++	rc = sara_wxprot_xattrs_name(d, XATTR_NAME_SEC_SARA_WXP, flags);
++	sara_xattrs_may_return(rc, XATTR_NAME_SEC_SARA_WXP, d->d_name.name);
++	return 1;
++}
++
++
++/*
++ * LSM hooks
++ */
++static int sara_bprm_set_creds(struct linux_binprm *bprm)
++{
++	int i;
++	struct wxprot_config_container *c;
++	u16 sara_wxp_flags = default_flags;
++	char *buf = NULL;
++	char *path = NULL;
++	struct cred *current_new;
++
++	sara_wxp_flags = get_sara_wxp_flags(bprm->cred);
++	get_sara_mmap_blocked(bprm->cred) = false;
++	get_sara_relro_page_found(bprm->cred) = false;
++	get_sara_relro_page(bprm->cred) = 0;
++	get_sara_relro_file(bprm->cred) = NULL;
++	get_sara_wxp_flags(bprm->cred) = SARA_WXP_NONE;
++	get_sara_execve_flags(bprm->cred) = SARA_WXP_NONE;
++
++	if (!sara_enabled || !wxprot_enabled)
++		return 0;
++
++	if (sara_wxprot_xattrs(bprm->file->f_path.dentry,
++			       &sara_wxp_flags) == 0)
++		goto flags_set;
++
++	/*
++	 * SARA_WXP_TRANSFER means that the parent
++	 * wants this child to inherit its flags.
++	 */
++	if (!(sara_wxp_flags & SARA_WXP_TRANSFER)) {
++		sara_wxp_flags = default_flags;
++		path = get_absolute_path(&bprm->file->f_path, &buf);
++		if (IS_ERR(path)) {
++			path = (char *) bprm->interp;
++			if (PTR_ERR(path) == -ENAMETOOLONG)
++				pr_warn_ratelimited("WXP: path too long for '%s'. Default flags will be used.\n",
++						path);
++			else
++				pr_warn_ratelimited("WXP: can't find path for '%s'. Default flags will be used.\n",
++						path);
++			goto skip_flags;
++		}
++		SARA_CONFIG_GET_RCU(c, wxprot_config);
++		for (i = 0; i < c->rules_size; ++i) {
++			if ((c->rules[i].exact &&
++			     strcmp(c->rules[i].path, path) == 0) ||
++			    (!c->rules[i].exact &&
++			     strncmp(c->rules[i].path, path,
++				     strlen(c->rules[i].path)) == 0)) {
++				sara_wxp_flags = c->rules[i].flags;
++				/* most specific path always come first */
++				break;
++			}
++		}
++		SARA_CONFIG_PUT_RCU(c);
++	} else
++		path = (char *) bprm->interp;
++
++flags_set:
++	if (sara_wxp_flags != default_flags &&
++	    sara_wxp_flags & SARA_WXP_VERBOSE)
++		pr_debug_ratelimited("WXP: '%s' run with flags '0x%x'.\n",
++				     path, sara_wxp_flags);
++
++skip_flags:
++	i = set_relro_page(bprm);
++	/*
++	 * i != 0 means no relro segment
++	 * i == 1 means the file wasn't an ELF
++	 *
++	 * We want to disable SARA_WXP_MMAP when the file is missing
++	 * the RELRO segment.
++	 * We want to verbosely report this case only if the file
++	 * was an ELF.
++	 *
++	 */
++	if (i != 0) {
++		if (sara_wxp_flags & SARA_WXP_VERBOSE &&
++		    sara_wxp_flags & SARA_WXP_MMAP &&
++		    i == 1)
++			pr_notice_ratelimited("WXP: failed to find RELRO section in '%s'.\n",
++					      path);
++		sara_wxp_flags &= ~SARA_WXP_MMAP;
++	}
++	kvfree(buf);
++	get_sara_wxp_flags(bprm->cred) = sara_wxp_flags;
++
++	/*
++	 * Set the flags to be used for validation
++	 * during the execve and discard SARA_WXP_MMAP:
++	 * it doesn't make sense to prevent executable
++	 * mmap during execve.
++	 */
++	current_new = prepare_creds();
++	if (unlikely(current_new == NULL))
++		return -ENOMEM;
++	get_sara_execve_flags(current_new) = sara_wxp_flags & ~SARA_WXP_MMAP;
++	commit_creds(current_new);
++
++	return 0;
++}
++
++#define sara_warn_or_return(err, msg) do {		\
++	if ((sara_wxp_flags & SARA_WXP_VERBOSE))	\
++		pr_wxp(msg);				\
++	if (!(sara_wxp_flags & SARA_WXP_COMPLAIN))	\
++		return -err;				\
++} while (0)
++
++#define sara_warn_or_goto(label, msg) do {		\
++	if ((sara_wxp_flags & SARA_WXP_VERBOSE))	\
++		pr_wxp(msg);				\
++	if (!(sara_wxp_flags & SARA_WXP_COMPLAIN))	\
++		goto label;				\
++} while (0)
++
++static int sara_check_vmflags(vm_flags_t vm_flags)
++{
++	u16 sara_wxp_flags;
++
++	if (!sara_enabled || !wxprot_enabled)
++		return 0;
++
++	/*
++	 * Memory allocations done during an execve should be
++	 * checked against the rules of the new executable,
++	 * instead of those of the current one.
++	 */
++	if (current->in_execve)
++		sara_wxp_flags = get_current_sara_execve_flags();
++	else
++		sara_wxp_flags = get_current_sara_wxp_flags();
++
++	/*
++	 * Be quiet when using security_check_vmflags to decide
++	 * what to do with a PT_GNU_STACK header
++	 */
++	if (current->in_execve && vm_flags == (VM_EXEC|VM_READ|VM_WRITE))
++		sara_wxp_flags &= ~SARA_WXP_VERBOSE;
++
++	/*
++	 * If "W xor X" is active for the current thread
++	 * this function must not allow new allocations that
++	 * have both the VM_WRITE and the VM_EXEC flags.
++	 */
++	if (unlikely(sara_wxp_flags & SARA_WXP_WXORX &&
++		     vm_flags & VM_WRITE &&
++		     vm_flags & VM_EXEC))
++		sara_warn_or_return(EPERM, "W^X");
++	/*
++	 * When the "MMAP" protection is on and shared libraries have
++	 * been already loaded (i.e. get_current_sara_mmap_blocked
++	 * returns true), this function must not allow:
++	 *    - new executable allocations
++	 *    - new non-executable allocations that may become
++	 *      executable bypassing the "MPROTECT" restriction;
++	 *      the "MPROTECT" protection will prevent a non-executable
++	 *      area to became executable only if it has the
++	 *      "VM_MAYWRITE" flag on.
++	 */
++	if (unlikely(sara_wxp_flags & SARA_WXP_MMAP &&
++		     (vm_flags & VM_EXEC ||
++		      (!(vm_flags & VM_MAYWRITE) && (vm_flags & VM_MAYEXEC))) &&
++		     get_current_sara_mmap_blocked()))
++		sara_warn_or_return(EPERM, "executable mmap");
++
++	return 0;
++}
++
++static int sara_shm_shmat(struct kern_ipc_perm *shp,
++			  char __user *shmaddr,
++			  int shmflg)
++{
++	int block = 0;
++	u16 sara_wxp_flags;
++	char buf[TASK_COMM_LEN];
++
++	if (!sara_enabled || !wxprot_enabled)
++		return 0;
++
++	sara_wxp_flags = get_current_sara_wxp_flags();
++
++	/*
++	 * Allow executable mappings if and only if this shm
++	 * was never attached as writable.
++	 *
++	 * Allow writable mappings if and only if this shm
++	 * was never attached as executable.
++	 *
++	 * We don't need to handle the case in which this
++	 * shm is attached as both writable and executable:
++	 * sara_check_vmflags takes care of that.
++	 */
++	if (sara_wxp_flags & SARA_WXP_OTHER) {
++		if (shmflg & SHM_EXEC && shmflg & SHM_RDONLY) {
++			lock_sara_shm(shp);
++			if (unlikely(get_sara_shm_no_exec(shp)))
++				block = 1;
++			else
++				get_sara_shm_no_write(shp) = true;
++			unlock_sara_shm(shp);
++		} else if (!(shmflg & (SHM_EXEC | SHM_RDONLY))) {
++			lock_sara_shm(shp);
++			if (unlikely(get_sara_shm_no_write(shp)))
++				block = 2;
++			else
++				get_sara_shm_no_exec(shp) = true;
++			unlock_sara_shm(shp);
++		}
++	}
++
++	if ((sara_wxp_flags & SARA_WXP_VERBOSE)) {
++		if (unlikely(block)) {
++			get_task_comm(buf, current);
++			if (block == 1)
++				pr_notice_ratelimited("WXP: executable SHM in '%s' (%d).\n",
++						      buf, current->pid);
++			else if (block == 2)
++				pr_notice_ratelimited("WXP: writable SHM in '%s' (%d).\n",
++						      buf, current->pid);
++		}
++	}
++	if (unlikely(block) && !(sara_wxp_flags & SARA_WXP_COMPLAIN))
++		return -EACCES;
++	return 0;
++}
++
++static int sara_file_mprotect(struct vm_area_struct *vma,
++				unsigned long reqprot,
++				unsigned long prot)
++{
++	u16 sara_wxp_flags;
++
++	if (!sara_enabled || !wxprot_enabled)
++		return 0;
++
++	if (current->in_execve)
++		sara_wxp_flags = get_current_sara_execve_flags();
++	else
++		sara_wxp_flags = get_current_sara_wxp_flags();
++
++	/*
++	 * vmas that may have been writable at some time in the past
++	 * (i.e. have the VM_MAYWRITE flag on) shouldn't be allowed
++	 * to be marked executable, unless they already are.
++	 */
++	if (unlikely(sara_wxp_flags & SARA_WXP_MPROTECT &&
++		     prot & PROT_EXEC &&
++		     !(vma->vm_flags & VM_EXEC) &&
++		     vma->vm_flags & VM_MAYWRITE)) {
++		/*
++		 * If every MPROTECT flag is on and verbose reporting
++		 * isn't needed, skip checking where the vma points to.
++		 * Otherwise check if it points to a file mapping,
++		 * to heap, to stack or to anywhere else.
++		 */
++		if ((sara_wxp_flags & SARA_WXP_MPROTECT) == SARA_WXP_MPROTECT &&
++		    !(sara_wxp_flags & SARA_WXP_COMPLAIN) &&
++		    !(sara_wxp_flags & SARA_WXP_VERBOSE))
++			return -EACCES;
++		else if (vma->vm_file) {
++			if (sara_wxp_flags & SARA_WXP_OTHER)
++				sara_warn_or_return(EACCES,
++						    "mprotect on file mmap");
++		} else if (vma->vm_start >= vma->vm_mm->start_brk &&
++			vma->vm_end <= vma->vm_mm->brk) {
++			if (sara_wxp_flags & SARA_WXP_HEAP)
++				sara_warn_or_return(EACCES,
++						    "mprotect on heap");
++		} else if ((vma->vm_start <= vma->vm_mm->start_stack &&
++			    vma->vm_end >= vma->vm_mm->start_stack) ||
++			   vma_is_stack_for_current(vma)) {
++			if (sara_wxp_flags & SARA_WXP_STACK)
++				sara_warn_or_return(EACCES,
++						    "mprotect on stack");
++		} else if (sara_wxp_flags & SARA_WXP_OTHER)
++			sara_warn_or_return(EACCES,
++					    "mprotect on anon mmap");
++	}
++
++	/*
++	 * If "W xor X" is active for the current thread
++	 * VM_EXEC and VM_WRITE can't be turned on at
++	 * the same time, unless they already are.
++	 */
++	if (unlikely(sara_wxp_flags & SARA_WXP_WXORX &&
++		     prot & PROT_EXEC &&
++		     prot & PROT_WRITE &&
++		     (!(vma->vm_flags & VM_EXEC) ||
++		      !(vma->vm_flags & VM_WRITE))))
++		sara_warn_or_return(EACCES, "W^X");
++
++	/*
++	 * If the dynamic loader marks the "relro section" as
++	 * read-only then it has finished loading shared libraries
++	 * and, if the SARA_WXP_MMAP flag is on, new executable
++	 * mmaps will be blocked from now on.
++	 */
++	if (unlikely(vma->vm_flags & VM_WRITE &&
++		     !(prot & PROT_WRITE) &&
++		     is_relro_page(vma)))
++		get_current_sara_mmap_blocked() = true;
++
++	return 0;
++}
++
++static int sara_file_open(struct file *file, const struct cred *cred)
++{
++	struct task_struct *t;
++	struct mm_struct *mm;
++	u16 sara_wxp_flags = get_current_sara_wxp_flags();
++
++	/*
++	 * Prevent write access to /proc/.../mem
++	 * if it operates on the mm_struct of the
++	 * current process: it could be used to
++	 * bypass W^X.
++	 */
++
++	if (!sara_enabled ||
++	    !wxprot_enabled ||
++	    !(sara_wxp_flags & SARA_WXP_WXORX) ||
++	    !(file->f_mode & FMODE_WRITE))
++		return 0;
++
++	t = get_sara_inode_task(file_inode(file));
++	if (unlikely(t != NULL &&
++		     strcmp(file->f_path.dentry->d_name.name,
++			    "mem") == 0)) {
++		get_task_struct(t);
++		mm = get_task_mm(t);
++		put_task_struct(t);
++		if (unlikely(mm == current->mm))
++			sara_warn_or_goto(error,
++					  "write access to /proc/*/mem");
++		mmput(mm);
++	}
++	return 0;
++error:
++	mmput(mm);
++	return -EACCES;
++}
++
++#ifdef CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP
++static int sara_pagefault_handler(struct pt_regs *regs,
++				  unsigned long error_code,
++				  unsigned long address)
++{
++	if (!sara_enabled || !wxprot_enabled ||
++	    likely(!(get_current_sara_wxp_flags() & SARA_WXP_EMUTRAMP)))
++		return 0;
++	return sara_trampoline_emulator(regs, error_code, address);
++}
++#endif
++
++static int sara_getprocattr(struct task_struct *p, char *name, char **value)
++{
++	int ret;
++	u16 flags;
++	char *buf;
++
++	ret = -EINVAL;
++	if (strcmp(name, "wxprot") != 0)
++		goto out;
++
++	ret = -EACCES;
++	if (unlikely(current != p &&
++		     !capable(CAP_MAC_ADMIN)))
++		goto out;
++
++	ret = -ENOMEM;
++	buf = kzalloc(8, GFP_KERNEL);
++	if (unlikely(buf == NULL))
++		goto out;
++
++	if (!sara_enabled || !wxprot_enabled) {
++		flags = 0x0;
++	} else {
++		rcu_read_lock();
++		flags = get_sara_wxp_flags(__task_cred(p));
++		rcu_read_unlock();
++	}
++
++	snprintf(buf, 8, "0x%04x\n", flags);
++	ret = strlen(buf);
++	*value = buf;
++
++out:
++	return ret;
++}
++
++static int sara_setprocattr(const char *name, void *value, size_t size)
++{
++	int ret;
++	struct vm_area_struct *vma;
++	struct cred *new = prepare_creds();
++	u16 cur_flags;
++	u16 req_flags;
++	char *buf = NULL;
++
++	ret = -EINVAL;
++	if (!sara_enabled || !wxprot_enabled)
++		goto error;
++	if (unlikely(new == NULL))
++		return -ENOMEM;
++	if (strcmp(name, "wxprot") != 0)
++		goto error;
++	if (unlikely(value == NULL || size == 0 || size > 7))
++		goto error;
++	ret = -ENOMEM;
++	buf = kmalloc(size+1, GFP_KERNEL);
++	if (unlikely(buf == NULL))
++		goto error;
++	buf[size] = '\0';
++	memcpy(buf, value, size);
++	ret = -EINVAL;
++	if (unlikely(strlen(buf) != size))
++		goto error;
++	if (unlikely(kstrtou16(buf, 0, &req_flags) != 0))
++		goto error;
++	/*
++	 * SARA_WXP_FORCE_WXORX is a procattr only flag with a special
++	 * meaning and it isn't recognized by are_flags_valid
++	 */
++	if (unlikely(!are_flags_valid(req_flags & ~SARA_WXP_FORCE_WXORX)))
++		goto error;
++	/*
++	 * Extra checks on requested flags:
++	 *   - SARA_WXP_FORCE_WXORX requires SARA_WXP_WXORX
++	 *   - SARA_WXP_MMAP can only be activated if the program
++	 *     has a relro section
++	 *   - COMPLAIN mode can only be requested if it was already
++	 *     on (procattr can only be used to make protection stricter)
++	 *   - EMUTRAMP can only be activated if it was already on or
++	 *     if MPROTECT and WXORX weren't already on (procattr can
++	 *     only be used to make protection stricter)
++	 *   - VERBOSITY request is ignored
++	 */
++	if (unlikely(req_flags & SARA_WXP_FORCE_WXORX &&
++		     !(req_flags & SARA_WXP_WXORX)))
++		goto error;
++	if (unlikely(!get_current_sara_relro_page_found() &&
++		     req_flags & SARA_WXP_MMAP))
++		goto error;
++	cur_flags = get_current_sara_wxp_flags();
++	if (unlikely((req_flags & SARA_WXP_COMPLAIN) &&
++		     !(cur_flags & SARA_WXP_COMPLAIN)))
++		goto error;
++	if (unlikely((req_flags & SARA_WXP_EMUTRAMP) &&
++		     !(cur_flags & SARA_WXP_EMUTRAMP) &&
++		     (cur_flags & (SARA_WXP_MPROTECT |
++				   SARA_WXP_WXORX))))
++		goto error;
++	if (cur_flags & SARA_WXP_VERBOSE)
++		req_flags |= SARA_WXP_VERBOSE;
++	else
++		req_flags &= ~SARA_WXP_VERBOSE;
++	/*
++	 * Except SARA_WXP_COMPLAIN and SARA_WXP_EMUTRAMP,
++	 * any other flag can't be removed (procattr can
++	 * only be used to make protection stricter).
++	 */
++	if (unlikely(cur_flags & (req_flags ^ cur_flags) &
++		     ~(SARA_WXP_COMPLAIN|SARA_WXP_EMUTRAMP)))
++		goto error;
++	ret = -EINTR;
++	/*
++	 * When SARA_WXP_FORCE_WXORX is on we traverse all the
++	 * memory and remove the write permission from any area
++	 * that is both writable and executable.
++	 */
++	if (req_flags & SARA_WXP_FORCE_WXORX) {
++		if (down_write_killable(&current->mm->mmap_sem))
++			goto error;
++		for (vma = current->mm->mmap; vma; vma = vma->vm_next) {
++			if (vma->vm_flags & VM_EXEC &&
++			    vma->vm_flags & VM_WRITE) {
++				vma->vm_flags &= ~VM_WRITE;
++				vma_set_page_prot(vma);
++				change_protection(vma,
++						  vma->vm_start,
++						  vma->vm_end,
++						  vma->vm_page_prot,
++						  0,
++						  0);
++			}
++		}
++		up_write(&current->mm->mmap_sem);
++	}
++	get_sara_wxp_flags(new) = req_flags & ~SARA_WXP_FORCE_WXORX;
++	commit_creds(new);
++	ret = size;
++	goto out;
++
++error:
++	abort_creds(new);
++out:
++	kfree(buf);
++	return ret;
++}
++
++static struct security_hook_list wxprot_hooks[] __ro_after_init = {
++	LSM_HOOK_INIT(bprm_set_creds, sara_bprm_set_creds),
++	LSM_HOOK_INIT(check_vmflags, sara_check_vmflags),
++	LSM_HOOK_INIT(shm_shmat, sara_shm_shmat),
++	LSM_HOOK_INIT(file_mprotect, sara_file_mprotect),
++	LSM_HOOK_INIT(file_open, sara_file_open),
++#ifdef CONFIG_SECURITY_SARA_WXPROT_EMUTRAMP
++	LSM_HOOK_INIT(pagefault_handler, sara_pagefault_handler),
++#endif
++	LSM_HOOK_INIT(getprocattr, sara_getprocattr),
++	LSM_HOOK_INIT(setprocattr, sara_setprocattr),
++};
++
++struct binary_config_header {
++	char magic[8];
++	__le32 version;
++	__le32 rules_size;
++	char hash[SARA_CONFIG_HASH_LEN];
++} __packed;
++
++struct binary_config_rule {
++	__le16 path_len;
++	__le16 flags;
++	u8 exact;
++} __packed;
++
++static void config_free(struct wxprot_config_container *data)
++{
++	int i;
++
++	for (i = 0; i < data->rules_size; ++i)
++		kfree(data->rules[i].path);
++	kvfree(data->rules);
++	kfree(data);
++}
++
++static int config_load(const char *buf, size_t buf_len)
++{
++	int ret;
++	int i, j;
++	int path_len;
++	size_t inc;
++	size_t last_path_len = SARA_PATH_MAX;
++	bool last_exact = true;
++	const char *pos;
++	struct wxprot_config_container *new;
++	struct binary_config_header *h;
++	struct binary_config_rule *r;
++
++	ret = -EINVAL;
++	if (unlikely(buf_len < sizeof(*h)))
++		goto out;
++
++	h = (struct binary_config_header *) buf;
++	pos = buf + sizeof(*h);
++
++	ret = -EINVAL;
++	if (unlikely(memcmp(h->magic, "SARAWXPR", 8) != 0))
++		goto out;
++	if (unlikely(le32_to_cpu(h->version) != wxprot_config_version))
++		goto out;
++
++	ret = -ENOMEM;
++	new = kmalloc(sizeof(*new), GFP_KERNEL);
++	if (unlikely(new == NULL))
++		goto out;
++	kref_init(&new->refcount);
++	new->rules_size = le32_to_cpu(h->rules_size);
++	BUILD_BUG_ON(sizeof(new->hash) != sizeof(h->hash));
++	memcpy(new->hash, h->hash, sizeof(new->hash));
++	if (unlikely(new->rules_size == 0)) {
++		new->rules = NULL;
++		goto replace;
++	}
++
++	ret = -ENOMEM;
++	new->rules = kvmalloc_array(new->rules_size,
++				    sizeof(*new->rules),
++				    GFP_KERNEL | __GFP_ZERO);
++
++	if (unlikely(new->rules == NULL))
++		goto out_new;
++	for (i = 0; i < new->rules_size; ++i) {
++		r = (struct binary_config_rule *) pos;
++		pos += sizeof(*r);
++		inc = pos-buf;
++		path_len = le16_to_cpu(r->path_len);
++		new->rules[i].flags = le16_to_cpu(r->flags);
++		new->rules[i].exact = r->exact;
++
++		ret = -EINVAL;
++		if (unlikely(inc + path_len > buf_len))
++			goto out_rules;
++		if (unlikely(path_len > last_path_len))
++			goto out_rules;
++		if (unlikely((int) new->rules[i].exact != 0 &&
++			     (int) new->rules[i].exact != 1))
++			goto out_rules;
++		if (unlikely(path_len == last_path_len &&
++			     new->rules[i].exact &&
++			     !last_exact))
++			goto out_rules;
++		if (!are_flags_valid(new->rules[i].flags))
++			goto out_rules;
++		if (path_len > 0) {
++			if (pos[0] != '/')
++				goto out_rules;
++			for (j = 0; j < path_len - 1; ++j) {
++				if (pos[j] == '/' &&
++				pos[j+1] == '/')
++					goto out_rules;
++				if (j + 2 < path_len &&
++				pos[j] == '/' &&
++				pos[j+1] == '.' &&
++				pos[j+2] == '/')
++					goto out_rules;
++				if (j + 3 < path_len &&
++				pos[j] == '/' &&
++				pos[j+1] == '.' &&
++				pos[j+2] == '.' &&
++				pos[j+3] == '/')
++					goto out_rules;
++			}
++		}
++
++		ret = -ENOMEM;
++		new->rules[i].path = kmalloc(path_len+1, GFP_KERNEL);
++		if (unlikely(new->rules[i].path == NULL))
++			goto out_rules;
++		memcpy(new->rules[i].path, pos, path_len);
++		new->rules[i].path[path_len] = '\0';
++		if (i > 0 &&
++		    unlikely(new->rules[i].exact == new->rules[i-1].exact &&
++			     strcmp(new->rules[i].path,
++				    new->rules[i-1].path) == 0))
++			goto out_rules;
++		pos += path_len;
++		last_path_len = path_len;
++		last_exact = new->rules[i].exact;
++	}
++	new->buf_len = (size_t) (pos-buf);
++
++replace:
++	SARA_CONFIG_REPLACE(wxprot_config,
++			    new,
++			    config_free,
++			    &wxprot_config_lock);
++	pr_notice("WXP: new rules loaded.\n");
++	return 0;
++
++out_rules:
++	for (i = 0; i < new->rules_size; ++i)
++		kfree(new->rules[i].path);
++	kvfree(new->rules);
++out_new:
++	kfree(new);
++out:
++	pr_notice("WXP: failed to load rules.\n");
++	return ret;
++}
++
++static ssize_t config_dump(char **buf)
++{
++	int i;
++	ssize_t ret;
++	size_t buf_len;
++	char *pos;
++	char *mybuf;
++	u16 path_len;
++	int rulen;
++	struct wxprot_config_container *c;
++	struct wxprot_rule *rc;
++	struct binary_config_header *h;
++	struct binary_config_rule *r;
++
++	ret = -ENOMEM;
++	SARA_CONFIG_GET(c, wxprot_config);
++	buf_len = c->buf_len;
++	mybuf = kvmalloc(buf_len, GFP_KERNEL_ACCOUNT);
++	if (unlikely(mybuf == NULL))
++		goto out;
++	rulen = c->rules_size;
++	h = (struct binary_config_header *) mybuf;
++	memcpy(h->magic, "SARAWXPR", 8);
++	h->version = cpu_to_le32(SARA_WXPROT_CONFIG_VERSION);
++	h->rules_size = cpu_to_le32(rulen);
++	BUILD_BUG_ON(sizeof(c->hash) != sizeof(h->hash));
++	memcpy(h->hash, c->hash, sizeof(h->hash));
++	pos = mybuf + sizeof(*h);
++	for (i = 0; i < rulen; ++i) {
++		r = (struct binary_config_rule *) pos;
++		pos += sizeof(*r);
++		if (buf_len < (pos - mybuf))
++			goto out;
++		rc = &c->rules[i];
++		r->flags = cpu_to_le16(rc->flags);
++		r->exact = (u8) rc->exact;
++		path_len = strlen(rc->path);
++		r->path_len = cpu_to_le16(path_len);
++		if (buf_len < ((pos - mybuf) + path_len))
++			goto out;
++		memcpy(pos, rc->path, path_len);
++		pos += path_len;
++	}
++	ret = (ssize_t) (pos - mybuf);
++	*buf = mybuf;
++out:
++	SARA_CONFIG_PUT(c, config_free);
++	return ret;
++}
++
++static int config_hash(char **buf)
++{
++	int ret;
++	struct wxprot_config_container *config;
++
++	ret = -ENOMEM;
++	*buf = kzalloc(sizeof(config->hash), GFP_KERNEL);
++	if (unlikely(*buf == NULL))
++		goto out;
++
++	SARA_CONFIG_GET_RCU(config, wxprot_config);
++	memcpy(*buf, config->hash, sizeof(config->hash));
++	SARA_CONFIG_PUT_RCU(config);
++
++	ret = 0;
++out:
++	return ret;
++}
++
++static DEFINE_SARA_SECFS_BOOL_FLAG(wxprot_enabled_data,
++				   wxprot_enabled);
++static DEFINE_SARA_SECFS_BOOL_FLAG(wxprot_xattrs_enabled_data,
++				   wxprot_xattrs_enabled);
++static DEFINE_SARA_SECFS_BOOL_FLAG(wxprot_xattrs_user_data,
++				   wxprot_xattrs_user);
++
++static struct sara_secfs_fptrs fptrs __ro_after_init = {
++	.load = config_load,
++	.dump = config_dump,
++	.hash = config_hash,
++};
++
++static const struct sara_secfs_node wxprot_fs[] __initconst = {
++	{
++		.name = "enabled",
++		.type = SARA_SECFS_BOOL,
++		.data = (void *) &wxprot_enabled_data,
++	},
++	{
++		.name = "version",
++		.type = SARA_SECFS_READONLY_INT,
++		.data = (int *) &wxprot_config_version,
++	},
++	{
++		.name = "default_flags",
++		.type = SARA_SECFS_READONLY_INT,
++		.data = &default_flags,
++	},
++	{
++		.name = "emutramp_available",
++		.type = SARA_SECFS_READONLY_INT,
++		.data = (int *) &wxprot_emutramp,
++	},
++	{
++		.name = ".load",
++		.type = SARA_SECFS_CONFIG_LOAD,
++		.data = &fptrs,
++	},
++	{
++		.name = ".dump",
++		.type = SARA_SECFS_CONFIG_DUMP,
++		.data = &fptrs,
++	},
++	{
++		.name = "hash",
++		.type = SARA_SECFS_CONFIG_HASH,
++		.data = &fptrs,
++	},
++	{
++		.name = "xattr_enabled",
++		.type = SARA_SECFS_BOOL,
++		.data = (void *) &wxprot_xattrs_enabled_data,
++	},
++	{
++		.name = "xattr_user_allowed",
++		.type = SARA_SECFS_BOOL,
++		.data = (void *) &wxprot_xattrs_user_data,
++	},
++};
++
++
++int __init sara_wxprot_init(void)
++{
++	int ret;
++	struct wxprot_config_container *tmpc = NULL;
++
++	ret = -EINVAL;
++	if (!are_flags_valid(default_flags))
++		goto out_fail;
++	ret = -ENOMEM;
++	tmpc = kzalloc(sizeof(*tmpc), GFP_KERNEL);
++	if (unlikely(tmpc == NULL))
++		goto out_fail;
++	tmpc->buf_len = sizeof(struct binary_config_header);
++	kref_init(&tmpc->refcount);
++	wxprot_config = (struct wxprot_config_container __rcu *) tmpc;
++	ret = sara_secfs_subtree_register("wxprot",
++					  wxprot_fs,
++					  ARRAY_SIZE(wxprot_fs));
++	if (unlikely(ret))
++		goto out_fail;
++	security_add_hooks(wxprot_hooks, ARRAY_SIZE(wxprot_hooks), "sara");
++	return 0;
++
++out_fail:
++	kfree(tmpc);
++	return ret;
++}
++
++#endif /* CONFIG_SECURITY_SARA_WXPROT */
+diff -Nurp a/security/security.c b/security/security.c
+--- a/security/security.c	2018-11-13 20:09:00.000000000 +0100
++++ b/security/security.c	2018-11-20 10:51:05.403825798 +0100
+@@ -83,6 +83,8 @@ int __init security_init(void)
+ 	capability_add_hooks();
+ 	yama_add_hooks();
+ 	loadpin_add_hooks();
++	sara_init();
++	tpe_add_hooks();
+ 
+ 	/*
+ 	 * Load all the remaining security modules.
+@@ -949,6 +951,22 @@ int security_file_mprotect(struct vm_are
+ 	return call_int_hook(file_mprotect, 0, vma, reqprot, prot);
+ }
+ 
++int security_check_vmflags(vm_flags_t vmflags)
++{
++	return call_int_hook(check_vmflags, 0, vmflags);
++}
++
++int __maybe_unused security_pagefault_handler(struct pt_regs *regs,
++					      unsigned long error_code,
++					      unsigned long address)
++{
++	return call_int_hook(pagefault_handler,
++			     0,
++			     regs,
++			     error_code,
++			     address);
++}
++
+ int security_file_lock(struct file *file, unsigned int cmd)
+ {
+ 	return call_int_hook(file_lock, 0, file, cmd);
+@@ -1290,12 +1308,28 @@ EXPORT_SYMBOL(security_d_instantiate);
+ 
+ int security_getprocattr(struct task_struct *p, char *name, char **value)
+ {
+-	return call_int_hook(getprocattr, -EINVAL, p, name, value);
++	struct security_hook_list *hp;
++	int rc;
++
++	hlist_for_each_entry(hp, &security_hook_heads.getprocattr, list) {
++		rc = hp->hook.getprocattr(p, name, value);
++		if (rc != -EINVAL)
++			return rc;
++	}
++	return -EINVAL;
+ }
+ 
+ int security_setprocattr(const char *name, void *value, size_t size)
+ {
+-	return call_int_hook(setprocattr, -EINVAL, name, value, size);
++	struct security_hook_list *hp;
++	int rc;
++
++	hlist_for_each_entry(hp, &security_hook_heads.setprocattr, list) {
++		rc = hp->hook.setprocattr(name, value, size);
++		if (rc != -EINVAL)
++			return rc;
++	}
++	return -EINVAL;
+ }
+ 
+ int security_netlink_send(struct sock *sk, struct sk_buff *skb)
+diff -Nurp a/security/tpe/Kconfig b/security/tpe/Kconfig
+--- a/security/tpe/Kconfig	1970-01-01 01:00:00.000000000 +0100
++++ b/security/tpe/Kconfig	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,64 @@
++config SECURITY_TPE
++	bool "Trusted Path Execution (TPE)"
++	default n
++	help
++	  If you say Y here, you will be able to choose a gid to add to the
++	  supplementary groups of users you want to mark as "trusted."
++	  Untrusted users will not be able to execute any files that are not in
++	  root-owned directories writable only by root.  If the sysctl option
++	  is enabled, a sysctl option with name "tpe.enabled" is created.
++
++config SECURITY_TPE_GID
++	int
++	default SECURITY_TPE_TRUSTED_GID if (SECURITY_TPE && !SECURITY_TPE_INVERT_GID)
++	default SECURITY_TPE_UNTRUSTED_GID if (SECURITY_TPE && SECURITY_TPE_INVERT_GID)
++
++config SECURITY_TPE_TRUSTED_GID
++	int "GID for TPE-trusted users"
++	depends on SECURITY_TPE && !SECURITY_TPE_INVERT_GID
++	default 0
++	help
++	  Setting this GID determines what group TPE restrictions will be
++	  *disabled* for. If the sysctl option is enabled, a sysctl option
++	  with name "tpe.gid" is created.
++
++config SECURITY_TPE_UNTRUSTED_GID
++	int "GID for TPE-untrusted users"
++	depends on SECURITY_TPE && SECURITY_TPE_INVERT_GID
++	default 0
++	help
++	  Setting this GID determines what group TPE restrictions will be
++	  *enabled* for. If the sysctl option is enabled, a sysctl option
++	  with name "tpe.gid" is created.
++
++config SECURITY_TPE_INVERT_GID
++	bool "Invert GID option"
++	depends on SECURITY_TPE
++	help
++	  If you say Y here, the group you specify in the TPE configuration will
++	  decide what group TPE restrictions will be *enabled* for.  This
++	  option is useful if you want TPE restrictions to be restricted to a
++	  small subset of users. If the sysctl option is enabled, a sysctl option
++	  with name "tpe.invert_gid" is created.
++
++config SECURITY_TPE_STRICT
++	bool "Partially restrict all non-root users"
++	depends on SECURITY_TPE
++	help
++	  If you say Y here, all non-root users will be covered under
++	  a weaker TPE restriction.  This is separate from, and in addition to,
++	  the main TPE options that you have selected elsewhere.  Thus, if a
++	  "trusted" GID is chosen, this restriction applies to even that GID.
++	  Under this restriction, all non-root users will only be allowed to
++	  execute files in directories they own that are not group or
++	  world-writable, or in directories owned by root and writable only by
++	  root.  If the sysctl option is enabled, a sysctl option with name
++	  "tpe.strict" is created.
++
++config SECURITY_TPE_RESTRICT_ROOT
++	bool "Restrict root"
++	depends on SECURITY_TPE
++	help
++	  If you say Y here, root will be marked as untrusted. This will require
++	  root to pass all the same checks as any other untrusted user.
++
+diff -Nurp a/security/tpe/Makefile b/security/tpe/Makefile
+--- a/security/tpe/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ b/security/tpe/Makefile	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,3 @@
++obj-$(CONFIG_SECURITY_TPE) := tpe_lsm.o
++
++tpe-y := tpe_lsm.o
+diff -Nurp a/security/tpe/tpe_lsm.c b/security/tpe/tpe_lsm.c
+--- a/security/tpe/tpe_lsm.c	1970-01-01 01:00:00.000000000 +0100
++++ b/security/tpe/tpe_lsm.c	2018-11-20 10:51:05.403825798 +0100
+@@ -0,0 +1,218 @@
++/*
++ * Trusted Path Execution Security Module
++ *
++ * Copyright (C) 2017 Matt Brown
++ * Copyright (C) 2001-2014 Bradley Spengler, Open Source Security, Inc.
++ * http://www.grsecurity.net spender@grsecurity.net
++ * Copyright (C) 2011 Corey Henderson
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/kernel.h>
++#include <linux/uidgid.h>
++#include <linux/ratelimit.h>
++#include <linux/limits.h>
++#include <linux/cred.h>
++#include <linux/slab.h>
++#include <linux/lsm_hooks.h>
++#include <linux/sysctl.h>
++#include <linux/binfmts.h>
++#include <linux/string_helpers.h>
++#include <linux/dcache.h>
++#include <uapi/asm-generic/mman-common.h>
++
++#define global_root(x) uid_eq((x), GLOBAL_ROOT_UID)
++#define global_nonroot(x) (!uid_eq((x), GLOBAL_ROOT_UID))
++#define global_root_gid(x) (gid_eq((x), GLOBAL_ROOT_GID))
++#define global_nonroot_gid(x) (!gid_eq((x), GLOBAL_ROOT_GID))
++
++static int tpe_enabled __read_mostly = IS_ENABLED(CONFIG_SECURITY_TPE);
++static kgid_t tpe_gid __read_mostly = KGIDT_INIT(CONFIG_SECURITY_TPE_GID);
++static int tpe_invert_gid __read_mostly =
++	IS_ENABLED(CONFIG_SECURITY_TPE_INVERT_GID);
++static int tpe_strict __read_mostly = IS_ENABLED(CONFIG_SECURITY_TPE_STRICT);
++static int tpe_restrict_root __read_mostly =
++	IS_ENABLED(CONFIG_SECURITY_TPE_RESTRICT_ROOT);
++
++int print_tpe_error(struct file *file, char *reason1, char *reason2,
++	char *method)
++{
++	char *filepath;
++
++	filepath = kstrdup_quotable_file(file, GFP_KERNEL);
++
++	if (!filepath)
++		return -ENOMEM;
++
++	pr_warn_ratelimited("TPE: Denied %s of %s Reason: %s%s%s\n", method,
++		(IS_ERR(filepath) ? "failed fetching file path" : filepath),
++		reason1, reason2 ? " and " : "", reason2 ?: "");
++	kfree(filepath);
++	return -EPERM;
++}
++
++static int tpe_check(struct file *file, char *method)
++{
++	struct inode *inode;
++	struct inode *file_inode;
++	struct dentry *dir;
++	const struct cred *cred = current_cred();
++	char *reason1 = NULL;
++	char *reason2 = NULL;
++
++	dir = dget_parent(file->f_path.dentry);
++	inode = d_backing_inode(dir);
++	file_inode = d_backing_inode(file->f_path.dentry);
++
++	if (!tpe_enabled)
++		return 0;
++
++	/* never restrict root unless restrict_root sysctl is 1*/
++	if (global_root(cred->uid) && !tpe_restrict_root)
++		return 0;
++
++	if (!tpe_strict)
++		goto general_tpe_check;
++
++	/* TPE_STRICT: restrictions enforced even if the gid is trusted */
++	if (global_nonroot(inode->i_uid) && !uid_eq(inode->i_uid, cred->uid))
++		reason1 = "directory not owned by user";
++	else if (inode->i_mode & 0002)
++		reason1 = "file in world-writable directory";
++	else if ((inode->i_mode & 0020) && global_nonroot_gid(inode->i_gid))
++		reason1 = "file in group-writable directory";
++	else if (file_inode->i_mode & 0002)
++		reason1 = "file is world-writable";
++
++	if (reason1)
++		goto end;
++
++general_tpe_check:
++	/* determine if group is trusted */
++	if (global_root_gid(tpe_gid))
++		goto next_check;
++	if (!tpe_invert_gid && !in_group_p(tpe_gid))
++		reason2 = "not in trusted group";
++	else if (tpe_invert_gid && in_group_p(tpe_gid))
++		reason2 = "in untrusted group";
++	else
++		return 0;
++
++next_check:
++	/* main TPE checks */
++	if (global_nonroot(inode->i_uid))
++		reason1 = "file in non-root-owned directory";
++	else if (inode->i_mode & 0002)
++		reason1 = "file in world-writable directory";
++	else if ((inode->i_mode & 0020) && global_nonroot_gid(inode->i_gid))
++		reason1 = "file in group-writable directory";
++	else if (file_inode->i_mode & 0002)
++		reason1 = "file is world-writable";
++
++end:
++	dput(dir);
++	if (reason1)
++		return print_tpe_error(file, reason1, reason2, method);
++	else
++		return 0;
++}
++
++int tpe_mmap_file(struct file *file, unsigned long reqprot,
++	unsigned long prot, unsigned long flags)
++{
++	if (!file || !(prot & PROT_EXEC))
++		return 0;
++
++	return tpe_check(file, "mmap");
++}
++
++int tpe_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
++	unsigned long prot)
++{
++	if (!vma->vm_file)
++		return 0;
++	return tpe_check(vma->vm_file, "mprotect");
++}
++
++static int tpe_bprm_set_creds(struct linux_binprm *bprm)
++{
++	if (!bprm->file)
++		return 0;
++	return tpe_check(bprm->file, "exec");
++
++}
++
++static struct security_hook_list tpe_hooks[] = {
++	LSM_HOOK_INIT(mmap_file, tpe_mmap_file),
++	LSM_HOOK_INIT(file_mprotect, tpe_file_mprotect),
++	LSM_HOOK_INIT(bprm_set_creds, tpe_bprm_set_creds),
++};
++
++#ifdef CONFIG_SYSCTL
++struct ctl_path tpe_sysctl_path[] = {
++	{ .procname = "kernel", },
++	{ .procname = "tpe", },
++	{ }
++};
++
++static struct ctl_table tpe_sysctl_table[] = {
++	{
++		.procname	= "enabled",
++		.data		= &tpe_enabled,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "gid",
++		.data		= &tpe_gid,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "invert_gid",
++		.data		= &tpe_invert_gid,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "strict",
++		.data		= &tpe_strict,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "restrict_root",
++		.data		= &tpe_restrict_root,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= proc_dointvec,
++	},
++	{ }
++};
++static void __init tpe_init_sysctl(void)
++{
++	if (!register_sysctl_paths(tpe_sysctl_path, tpe_sysctl_table))
++		panic("TPE: sysctl registration failed.\n");
++}
++#else
++static inline void tpe_init_sysctl(void) { }
++#endif /* CONFIG_SYSCTL */
++
++void __init tpe_add_hooks(void)
++{
++	pr_info("TPE: securing systems like it's 1998\n");
++	security_add_hooks(tpe_hooks, ARRAY_SIZE(tpe_hooks), "tpe");
++	tpe_init_sysctl();
++}
