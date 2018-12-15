@@ -1,0 +1,82 @@
+diff -Nurp a/drivers/net/fjes/fjes_main.c b/drivers/net/fjes/fjes_main.c
+--- a/drivers/net/fjes/fjes_main.c
++++ b/drivers/net/fjes/fjes_main.c
+@@ -81,7 +81,7 @@ static const struct acpi_device_id fjes_
+ 	{"PNP0C02", 0},
+ 	{"", 0},
+ };
+-MODULE_DEVICE_TABLE(acpi, fjes_acpi_ids);
++/* MODULE_DEVICE_TABLE(acpi, fjes_acpi_ids); */
+ 
+ static struct acpi_driver fjes_acpi_driver = {
+ 	.name = DRV_NAME,
+diff -Nurp a/net/dccp/ipv4.c b/net/dccp/ipv4.c
+--- a/net/dccp/ipv4.c
++++ b/net/dccp/ipv4.c
+@@ -1072,8 +1072,8 @@ module_exit(dccp_v4_exit);
+  * values directly, Also cover the case where the protocol is not specified,
+  * i.e. net-pf-PF_INET-proto-0-type-SOCK_DCCP
+  */
+-MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET, 33, 6);
+-MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET, 0, 6);
++/* MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET, 33, 6); */
++/* MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET, 0, 6); */
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Arnaldo Carvalho de Melo <acme@mandriva.com>");
+ MODULE_DESCRIPTION("DCCP - Datagram Congestion Controlled Protocol");
+diff -Nurp a/net/dccp/ipv6.c b/net/dccp/ipv6.c
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@ -1125,8 +1125,8 @@ module_exit(dccp_v6_exit);
+  * values directly, Also cover the case where the protocol is not specified,
+  * i.e. net-pf-PF_INET6-proto-0-type-SOCK_DCCP
+  */
+-MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET6, 33, 6);
+-MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET6, 0, 6);
++/* MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET6, 33, 6); */
++/* MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_INET6, 0, 6); */
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Arnaldo Carvalho de Melo <acme@mandriva.com>");
+ MODULE_DESCRIPTION("DCCPv6 - Datagram Congestion Controlled Protocol");
+diff -Nurp a/net/decnet/af_decnet.c b/net/decnet/af_decnet.c
+--- a/net/decnet/af_decnet.c
++++ b/net/decnet/af_decnet.c
+@@ -2361,7 +2361,7 @@ static const struct proto_ops dn_proto_o
+ MODULE_DESCRIPTION("The Linux DECnet Network Protocol");
+ MODULE_AUTHOR("Linux DECnet Project Team");
+ MODULE_LICENSE("GPL");
+-MODULE_ALIAS_NETPROTO(PF_DECnet);
++/* MODULE_ALIAS_NETPROTO(PF_DECnet); */
+ 
+ static char banner[] __initdata = KERN_INFO "NET4: DECnet for Linux: V.2.5.68s (C) 1995-2003 Linux DECnet Project Team\n";
+ 
+diff -Nurp a/net/ieee802154/socket.c b/net/ieee802154/socket.c
+--- a/net/ieee802154/socket.c
++++ b/net/ieee802154/socket.c
+@@ -1117,4 +1117,4 @@ module_init(af_ieee802154_init);
+ module_exit(af_ieee802154_remove);
+ 
+ MODULE_LICENSE("GPL");
+-MODULE_ALIAS_NETPROTO(PF_IEEE802154);
++/* MODULE_ALIAS_NETPROTO(PF_IEEE802154); */
+diff -Nurp a/net/rds/af_rds.c b/net/rds/af_rds.c
+--- a/net/rds/af_rds.c
++++ b/net/rds/af_rds.c
+@@ -639,4 +639,4 @@ MODULE_DESCRIPTION("RDS: Reliable Datagr
+ 		   " v" DRV_VERSION " (" DRV_RELDATE ")");
+ MODULE_VERSION(DRV_VERSION);
+ MODULE_LICENSE("Dual BSD/GPL");
+-MODULE_ALIAS_NETPROTO(PF_RDS);
++/* MODULE_ALIAS_NETPROTO(PF_RDS); */
+diff -Nurp a/sound/drivers/pcsp/pcsp.c b/sound/drivers/pcsp/pcsp.c
+--- a/sound/drivers/pcsp/pcsp.c
++++ b/sound/drivers/pcsp/pcsp.c
+@@ -21,7 +21,7 @@ MODULE_AUTHOR("Stas Sergeev <stsp@users.
+ MODULE_DESCRIPTION("PC-Speaker driver");
+ MODULE_LICENSE("GPL");
+ MODULE_SUPPORTED_DEVICE("{{PC-Speaker, pcsp}}");
+-MODULE_ALIAS("platform:pcspkr");
++/*MODULE_ALIAS("platform:pcspkr");*/
+ 
+ static int index = SNDRV_DEFAULT_IDX1;	/* Index 0-MAX */
+ static char *id = SNDRV_DEFAULT_STR1;	/* ID for this card */
