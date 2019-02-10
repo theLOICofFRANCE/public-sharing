@@ -1,0 +1,313 @@
+From 5af947c0a4c43256188c85f4220af145cb5d3d99 Mon Sep 17 00:00:00 2001
+From: Matt Brown <matt@nmatt.com>
+Date: Tue, 16 May 2017 20:10:24 -0400
+Subject: [PATCH] Add Trusted Path Execution
+
+This patch was modified from Grsecurity's Trusted Path Execution feature
+
+Implements the concept described here: http://phrack.org/issues/52/6.html#article
+
+Signed-off-by: Matt Brown <matt@nmatt.com>
+---
+ fs/Makefile         |   1 +
+ fs/exec.c           |   6 +++
+ fs/tpe.c            | 112 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/tpe.h |  10 +++++
+ kernel/sysctl.c     |  35 ++++++++++++++++
+ security/Kconfig    |  58 +++++++++++++++++++++++++++
+ 6 files changed, 222 insertions(+)
+ create mode 100644 fs/tpe.c
+ create mode 100644 include/linux/tpe.h
+
+diff --git a/fs/Makefile b/fs/Makefile
+index 7bbaca9c67b1..d13ea128736a 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -61,6 +61,7 @@ obj-y				+= devpts/
+ 
+ obj-$(CONFIG_PROFILING)		+= dcookies.o
+ obj-$(CONFIG_DLM)		+= dlm/
++obj-$(CONFIG_SECURITY_TPE)	+= tpe.o
+  
+ # Do not add any filesystems before this line
+ obj-$(CONFIG_FSCACHE)		+= fscache/
+diff --git a/fs/exec.c b/fs/exec.c
+index 55d34442bbc0..84a6d64cb6f6 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -63,6 +63,7 @@
+ #include <linux/compat.h>
+ #include <linux/vmalloc.h>
+ #include <linux/random.h>
++#include <linux/tpe.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/mmu_context.h>
+@@ -1753,6 +1754,11 @@ static int do_execveat_common(int fd, struct filename *filename,
+ 	if (retval < 0)
+ 		goto out;
+ 
++	if (!tpe_allow(file)) {
++		retval = -EACCES;
++		goto out;
++	}
++
+ 	retval = copy_strings_kernel(1, &bprm->filename, bprm);
+ 	if (retval < 0)
+ 		goto out;
+diff --git a/fs/tpe.c b/fs/tpe.c
+new file mode 100644
+index 000000000000..7136ae8429d9
+--- /dev/null
++++ b/fs/tpe.c
+@@ -0,0 +1,112 @@
++/*
++ *  linux/fs/tpe.c
++ *
++ */
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/uidgid.h>
++#include <linux/tpe.h>
++#include <linux/ratelimit.h>
++#include <linux/limits.h>
++#include <linux/dcache.h>
++#include <linux/cred.h>
++#include <linux/slab.h>
++
++#define TPE_GLOBAL_UID(x) from_kuid_munged(&init_user_ns, (x))
++#define TPE_GLOBAL_GID(x) from_kgid_munged(&init_user_ns, (x))
++#define tpe_is_global_root(x) uid_eq((x), GLOBAL_ROOT_UID)
++#define tpe_is_global_nonroot(x) (!uid_eq((x), GLOBAL_ROOT_UID))
++#define tpe_is_global_nonroot_gid(x) (!gid_eq((x), GLOBAL_ROOT_GID))
++
++int security_tpe = IS_ENABLED(CONFIG_SECURITY_TPE);
++kgid_t security_tpe_gid = KGIDT_INIT(CONFIG_SECURITY_TPE_GID);
++int security_tpe_all = IS_ENABLED(CONFIG_SECURITY_TPE_ALL);
++int security_tpe_invert = IS_ENABLED(CONFIG_SECURITY_TPE_INVERT);
++
++int print_tpe_error(const struct file *file, char *reason1, char *reason2)
++{
++	char *filepath = kmalloc(PATH_MAX+1, GFP_KERNEL);
++	char error_msg[90] = {0};
++
++	if (!reason1)
++		kfree(filepath);
++		return 0;
++
++	if (reason2)
++		snprintf(error_msg, sizeof(error_msg), "%s and %s", reason1, reason2);
++	else
++		strncpy(error_msg, reason1, sizeof(error_msg));
++	
++	filepath = dentry_path_raw(file->f_path.dentry, filepath, PATH_MAX-1);
++
++	pr_warn_ratelimited("TPE: Denied execution of %s Reason: %s\n",
++		(IS_ERR(filepath) ? "failed fetching file path" : filepath),
++		error_msg
++	);
++	kfree(filepath);
++	return 1;
++
++}
++
++int tpe_allow(const struct file *file)
++{
++	struct inode *inode = d_backing_inode(file->f_path.dentry->d_parent);
++	struct inode *file_inode = d_backing_inode(file->f_path.dentry);
++	const struct cred *cred = current_cred();
++	char *reason1 = NULL;
++	char *reason2 = NULL;
++
++	//TPE is disabled
++	if (!security_tpe)
++		return 1;
++
++	// never restrict root
++	if (tpe_is_global_root(cred->uid))
++		return 1;
++
++	// Check for tpe_all
++	if (!security_tpe_all)
++		goto general_tpe_check;
++
++	// TPE_ALL: These restrictions are enforced even if the gid is trusted
++	if (tpe_is_global_nonroot(inode->i_uid) && !uid_eq(inode->i_uid, cred->uid))
++		reason1 = "directory not owned by user";
++	else if (inode->i_mode & S_IWOTH)
++		reason1 = "file in world-writable directory";
++	else if ((inode->i_mode & S_IWGRP) && tpe_is_global_nonroot_gid(inode->i_gid))
++		reason1 = "file in group-writable directory";
++	else if (file_inode->i_mode & S_IWOTH)
++		reason1 = "file is world-writable";
++
++	if (reason1)
++		goto end;
++
++general_tpe_check:
++	// determine if group is trusted
++	if (security_tpe_invert && !in_group_p(security_tpe_gid))
++		reason2 = "not in trusted group";
++	else if (!security_tpe_invert && in_group_p(security_tpe_gid))
++		reason2 = "in untrusted group";
++	else
++		return 1;
++
++	// main TPE checks
++	if (tpe_is_global_nonroot(inode->i_uid))
++		reason1 = "file in non-root-owned directory";
++	else if (inode->i_mode & S_IWOTH)
++		reason1 = "file in world-writable directory";
++	else if ((inode->i_mode & S_IWGRP) && tpe_is_global_nonroot_gid(inode->i_gid))
++		reason1 = "file in group-writable directory";
++	else if (file_inode->i_mode & S_IWOTH)
++		reason1 = "file is world-writable";
++
++end:
++	if (reason1) {
++		print_tpe_error(file, reason1, reason2);
++		return 0;
++	} else {
++		return 1;
++	}
++}
+diff --git a/include/linux/tpe.h b/include/linux/tpe.h
+new file mode 100644
+index 000000000000..b9953d0c306c
+--- /dev/null
++++ b/include/linux/tpe.h
+@@ -0,0 +1,10 @@
++/*
++ *  linux/fs/tpe.h
++ *
++ */
++
++extern int security_tpe;
++extern kgid_t security_tpe_gid;
++extern int security_tpe_all;
++extern int security_tpe_invert;
++extern int tpe_allow(const struct file *file);
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index e1c52497c7ef..a88e1f379a11 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -68,6 +68,7 @@
+ #include <linux/bpf.h>
+ #include <linux/mount.h>
+ #include <linux/tty.h>
++#include <linux/tpe.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/processor.h>
+@@ -1874,6 +1875,40 @@ static struct ctl_table fs_table[] = {
+ 		.proc_handler	= proc_dointvec_minmax,
+ 		.extra1		= &one,
+ 	},
++#ifdef CONFIG_SECURITY_TPE
++	{
++		.procname	= "tpe",
++		.data		= &security_tpe,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= &proc_dointvec,
++	},
++	{
++		.procname	= "tpe_gid",
++		.data		= &security_tpe_gid,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= &proc_dointvec,
++	},
++#endif
++#ifdef CONFIG_SECURITY_TPE_INVERT
++	{
++		.procname	= "tpe_invert",
++		.data		= &security_tpe_invert,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= &proc_dointvec,
++	},
++#endif
++#ifdef CONFIG_SECURITY_TPE_ALL
++	{
++		.procname	= "tpe_restrict_all",
++		.data		= &security_enable_tpe_all,
++		.maxlen		= sizeof(int),
++		.mode		= 0600,
++		.proc_handler	= &proc_dointvec,
++	},
++#endif
+ 	{ }
+ };
+ 
+diff --git a/security/Kconfig b/security/Kconfig
+index 34fb609b372d..f7d786044977 100644
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -239,6 +239,64 @@ config STATIC_USERMODEHELPER_PATH
+ 	  If you wish for all usermode helper programs to be disabled,
+ 	  specify an empty string here (i.e. "").
+ 
++config SECURITY_TPE
++	bool "Trusted Path Execution (TPE)"
++	default n
++	help
++	  If you say Y here, you will be able to choose a gid to add to the
++	  supplementary groups of users you want to mark as "untrusted."
++	  These users will not be able to execute any files that are not in
++	  root-owned directories writable only by root.  If the sysctl option
++	  is enabled, a sysctl option with name "tpe" is created.
++
++config SECURITY_TPE_ALL
++	bool "Partially restrict all non-root users"
++	depends on SECURITY_TPE
++	help
++	  If you say Y here, all non-root users will be covered under
++	  a weaker TPE restriction.  This is separate from, and in addition to,
++	  the main TPE options that you have selected elsewhere.  Thus, if a
++	  "trusted" GID is chosen, this restriction applies to even that GID.
++	  Under this restriction, all non-root users will only be allowed to
++	  execute files in directories they own that are not group or
++	  world-writable, or in directories owned by root and writable only by
++	  root.  If the sysctl option is enabled, a sysctl option with name
++	  "tpe_restrict_all" is created.
++
++config SECURITY_TPE_INVERT
++	bool "Invert GID option"
++	depends on SECURITY_TPE
++	help
++	  If you say Y here, the group you specify in the TPE configuration will
++	  decide what group TPE restrictions will be *disabled* for.  This
++	  option is useful if you want TPE restrictions to be applied to most
++	  users on the system.  If the sysctl option is enabled, a sysctl option
++	  with name "tpe_invert" is created.  Unlike other sysctl options, this
++	  entry will default to on for backward-compatibility.
++
++config SECURITY_TPE_GID
++	int
++	default SECURITY_TPE_UNTRUSTED_GID if (SECURITY_TPE && !SECURITY_TPE_INVERT)
++	default SECURITY_TPE_TRUSTED_GID if (SECURITY_TPE && SECURITY_TPE_INVERT)
++
++config SECURITY_TPE_UNTRUSTED_GID
++	int "GID for TPE-untrusted users"
++	depends on SECURITY_TPE && !SECURITY_TPE_INVERT
++	default 1005
++	help
++	  Setting this GID determines what group TPE restrictions will be
++	  *enabled* for.  If the sysctl option is enabled, a sysctl option
++	  with name "tpe_gid" is created.
++
++config SECURITY_TPE_TRUSTED_GID
++	int "GID for TPE-trusted users"
++	depends on SECURITY_TPE && SECURITY_TPE_INVERT
++	default 1005
++	help
++	  Setting this GID determines what group TPE restrictions will be
++	  *disabled* for.  If the sysctl option is enabled, a sysctl option
++	  with name "tpe_gid" is created.
++
+ source security/selinux/Kconfig
+ source security/smack/Kconfig
+ source security/tomoyo/Kconfig
