@@ -1,0 +1,46 @@
+From fe43bb8ca4afb604773746e187f183b6acef8f53 Mon Sep 17 00:00:00 2001
+From: Leif Sahlberg <lsahlber@redhat.com>
+Date: Wed, 23 Oct 2019 14:34:40 -0400
+Subject: [PATCH 9117/9125] [fs] SMB3: retry on STATUS_INSUFFICIENT_RESOURCES
+ instead of failing write
+Message-id: <20191023143440.15936-1-lsahlber@redhat.com>
+Patchwork-id: 280812
+O-Subject: [RHEL7.8 BZ 1764567] SMB3: retry on STATUS_INSUFFICIENT_RESOURCES instead of failing write
+Bugzilla: 1764567
+Z-Bugzilla: 1767621
+RH-Acked-by: Steve Dickson <SteveD@redhat.com>
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+From: Steve French <stfrench@microsoft.com>
+Bugzilla: 1764567
+Build: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=24214369
+Some servers such as Windows 10 will return STATUS_INSUFFICIENT_RESOURCES
+as the number of simultaneous SMB3 requests grows (even though the client
+has sufficient credits).  Return EAGAIN on STATUS_INSUFFICIENT_RESOURCES
+so that we can retry writes which fail with this status code.
+This (for example) fixes large file copies to Windows 10 on fast networks.
+Signed-off-by: Steve French <stfrench@microsoft.com>
+CC: Stable <stable@vger.kernel.org>
+Reviewed-by: Ronnie Sahlberg <lsahlber@redhat.com>
+Reviewed-by: Pavel Shilovsky <pshilov@microsoft.com>
+(cherry picked from commit 8d526d62db907e786fd88948c75d1833d82bd80e)
+Signed-off-by: Ronnie Sahlberg <lsahlber@redhat.com>
+Signed-off-by: Frantisek Hrbata <fhrbata@hrbata.com>
+---
+ fs/cifs/smb2maperror.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+diff --git a/fs/cifs/smb2maperror.c b/fs/cifs/smb2maperror.c
+index 3bfc9c9..c7616ce 100644
+--- a/fs/cifs/smb2maperror.c
++++ b/fs/cifs/smb2maperror.c
+@@ -456,7 +456,7 @@ static const struct status_to_posix_error smb2_error_map_table[] = {
+ 	{STATUS_FILE_INVALID, -EIO, "STATUS_FILE_INVALID"},
+ 	{STATUS_ALLOTTED_SPACE_EXCEEDED, -EIO,
+ 	"STATUS_ALLOTTED_SPACE_EXCEEDED"},
+-	{STATUS_INSUFFICIENT_RESOURCES, -EREMOTEIO,
++	{STATUS_INSUFFICIENT_RESOURCES, -EAGAIN,
+ 				"STATUS_INSUFFICIENT_RESOURCES"},
+ 	{STATUS_DFS_EXIT_PATH_FOUND, -EIO, "STATUS_DFS_EXIT_PATH_FOUND"},
+ 	{STATUS_DEVICE_DATA_ERROR, -EIO, "STATUS_DEVICE_DATA_ERROR"},
+-- 
+1.8.3.1

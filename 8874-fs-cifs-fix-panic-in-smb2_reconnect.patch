@@ -1,0 +1,71 @@
+From d3a5878bdabfc3ecef1e8dfc2fe2dc4ee596fb46 Mon Sep 17 00:00:00 2001
+From: Leif Sahlberg <lsahlber@redhat.com>
+Date: Thu, 30 May 2019 01:02:49 -0400
+Subject: [PATCH 8874/9125] [fs] cifs: fix panic in smb2_reconnect
+Message-id: <20190530010249.12174-1-lsahlber@redhat.com>
+Patchwork-id: 261185
+O-Subject: [RHEL7.7 fs] cifs: fix panic in smb2_reconnect
+Bugzilla: 1702264
+Z-Bugzilla: 1737382
+RH-Acked-by: J. Bruce Fields <bfields@redhat.com>
+RH-Acked-by: Benjamin Coddington <bcodding@redhat.com>
+Bugzilla: 1702264
+Build: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=21914599
+RHEL-Only
+This patch contains changes that will not merge with upstream so we will send a separate, smaller
+patch to upstream for this fix.
+Signed-off-by: Ronnie Sahlberg <lsahlber@redhat.com>
+Signed-off-by: Bruno Meneguele <bmeneg@redhat.com>
+---
+ fs/cifs/cifsproto.h | 1 +
+ fs/cifs/connect.c   | 2 +-
+ fs/cifs/smb2pdu.c   | 3 +++
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index bdd1c89..a2356f9 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -228,6 +228,7 @@ extern void cifs_del_pending_open(struct cifs_pending_open *open);
+ extern void cifs_put_tcp_session(struct TCP_Server_Info *server,
+ 				 int from_reconnect);
+ extern void cifs_put_tcon(struct cifs_tcon *tcon);
++extern void cifs_put_smb_ses(struct cifs_ses *ses);
+ 
+ #if IS_ENABLED(CONFIG_CIFS_DFS_UPCALL)
+ extern void cifs_dfs_release_automount_timer(void);
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 9a641bd..70e7050 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -2554,7 +2554,7 @@ cifs_find_smb_ses(struct TCP_Server_Info *server, struct smb_vol *vol)
+ 	return NULL;
+ }
+ 
+-static void
++void
+ cifs_put_smb_ses(struct cifs_ses *ses)
+ {
+ 	unsigned int rc, xid;
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 356e69a..a958b9b 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -2300,6 +2300,7 @@ void smb2_reconnect_server(struct work_struct *work)
+ 		if (ses->tcon_ipc && ses->tcon_ipc->need_reconnect) {
+ 			list_add_tail(&ses->tcon_ipc->rlist, &tmp_list);
+ 			tcon_exist = true;
++			ses->ses_count++;
+ 		}
+ 	}
+ 	/*
+@@ -2318,6 +2319,8 @@ void smb2_reconnect_server(struct work_struct *work)
+ 		else
+ 			resched = true;
+ 		list_del_init(&tcon->rlist);
++		if (tcon->ipc)
++			cifs_put_smb_ses(tcon->ses);
+ 		cifs_put_tcon(tcon);
+ 	}
+ 
+-- 
+1.8.3.1
