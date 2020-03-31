@@ -1,0 +1,24 @@
+From 3d5e229212df0b0d08322f34bdbb66c31670fbf2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Lo=C3=AFc?= <4661917+HacKurx@users.noreply.github.com>
+Date: Fri, 21 Dec 2018 18:50:15 +0100
+Subject: [PATCH] sched/debug: Change /proc/sched_debug from 0444 to 0400
+
+Just like the upstream commit 8e7df2b, there's not enough reasons to read this file as non-root.
+The old CVE-2014-1738 could have been prevented by this.
+---
+ kernel/sched/debug.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 6383aa6a60ca0..1a4e3c26171a3 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -824,7 +824,7 @@ static const struct seq_operations sched_debug_sops = {
+ 
+ static int __init init_sched_debug_procfs(void)
+ {
+-	if (!proc_create_seq("sched_debug", 0444, NULL, &sched_debug_sops))
++	if (!proc_create_seq("sched_debug", 0400, NULL, &sched_debug_sops))
+ 		return -ENOMEM;
+ 	return 0;
+ }
