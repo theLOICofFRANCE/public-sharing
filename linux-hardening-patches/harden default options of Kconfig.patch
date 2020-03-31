@@ -1,0 +1,104 @@
+diff -Nurp a/arch/Kconfig b/arch/Kconfig
+--- a/arch/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/arch/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -403,6 +403,7 @@ menuconfig GCC_PLUGINS
+ 	bool "GCC plugins"
+ 	depends on HAVE_GCC_PLUGINS
+ 	depends on !COMPILE_TEST
++	default y
+ 	help
+ 	  GCC plugins are loadable modules that provide extra features to the
+ 	  compiler. They are useful for runtime instrumentation and static analysis.
+diff -Nurp a/drivers/char/Kconfig b/drivers/char/Kconfig
+--- a/drivers/char/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/drivers/char/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -19,6 +19,7 @@ config DEVKMEM
+ 	bool "/dev/kmem virtual device support"
+ 	# On arm64, VMALLOC_START < PAGE_OFFSET, which confuses kmem read/write
+ 	depends on !ARM64
++	default n
+ 	help
+ 	  Say Y here if you want to support the /dev/kmem device. The
+ 	  /dev/kmem device is rarely used, but can be used for certain
+diff -Nurp a/fs/proc/Kconfig b/fs/proc/Kconfig
+--- a/fs/proc/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/fs/proc/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -39,6 +39,7 @@ config PROC_KCORE
+ config PROC_VMCORE
+ 	bool "/proc/vmcore support"
+ 	depends on PROC_FS && CRASH_DUMP
++	default n
+         help
+         Exports the dump image of crashed kernel in ELF format.
+ 
+@@ -62,7 +63,7 @@ config PROC_SYSCTL
+ 	  limited in memory.
+ 
+ config PROC_PAGE_MONITOR
+- 	default y
++ 	default n
+ 	depends on PROC_FS && MMU
+ 	bool "Enable /proc page monitoring" if EXPERT
+  	help
+diff -Nurp a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/init/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -298,7 +298,7 @@ config FHANDLE
+ 
+ config USELIB
+ 	bool "uselib syscall"
+-	def_bool ALPHA || M68K || SPARC || X86_32 || IA32_EMULATION
++	default n
+ 	help
+ 	  This option enables the uselib syscall, a system call used in the
+ 	  dynamic linker from libc5 and earlier.  glibc does not use this
+@@ -1521,6 +1521,7 @@ config SLUB_MEMCG_SYSFS_ON
+ 
+ config COMPAT_BRK
+ 	bool "Disable heap randomization"
++	default n
+ 	help
+ 	  Randomizing heap placement makes heap exploits harder, but it
+ 	  also breaks ancient binaries (including anything libc5 based).
+@@ -1567,6 +1568,7 @@ endchoice
+ 
+ config SLAB_MERGE_DEFAULT
+ 	bool "Allow slab caches to be merged"
++	default n
+ 	help
+ 	  For reduced kernel memory fragmentation, slab caches can be
+ 	  merged when they share the same size and other characteristics.
+diff -Nurp a/kernel/trace/Kconfig b/kernel/trace/Kconfig
+--- a/kernel/trace/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/kernel/trace/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -456,7 +456,7 @@ config UPROBE_EVENTS
+ 	select UPROBES
+ 	select PROBE_EVENTS
+ 	select TRACING
+-	default y
++	default n
+ 	help
+ 	  This allows the user to add tracing events on top of userspace
+ 	  dynamic events (similar to tracepoints) on the fly via the trace
+diff -Nurp a/net/sctp/Kconfig b/net/sctp/Kconfig
+--- a/net/sctp/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/net/sctp/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -4,6 +4,7 @@
+ 
+ menuconfig IP_SCTP
+ 	tristate "The SCTP Protocol"
++	default n
+ 	depends on INET
+ 	depends on IPV6 || IPV6=n
+ 	select CRYPTO
+diff -Nurp a/net/tipc/Kconfig b/net/tipc/Kconfig
+--- a/net/tipc/Kconfig	2018-12-18 03:21:00.000000000 +0100
++++ b/net/tipc/Kconfig	2018-12-21 16:35:24.000000000 +0100
+@@ -4,6 +4,7 @@
+ 
+ menuconfig TIPC
+ 	tristate "The TIPC Protocol"
++	default n
+ 	depends on INET
+ 	---help---
+ 	  The Transparent Inter Process Communication (TIPC) protocol is

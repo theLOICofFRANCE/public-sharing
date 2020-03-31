@@ -1,0 +1,26 @@
+From a3bdc9b8b48bdb11966b2e2aa3f9dfdf88196613 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Lo=C3=AFc?= <4661917+HacKurx@users.noreply.github.com>
+Date: Fri, 11 Jan 2019 15:40:07 +0100
+Subject: [PATCH] log the access to SUID
+
+Log the access to SUID. The display format is as follows:
+
+[   9.799423] linux-hardened: exim4 executed by the uid/euid:0/0 just used a SUID
+[  78.596654] linux-hardened: bash executed by the uid/euid:1000/1000 just used a SUID
+---
+ fs/exec.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/exec.c b/fs/exec.c
+index 69fcee853363..783c2d484316 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1535,6 +1535,8 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
+ 		 !kgid_has_mapping(bprm->cred->user_ns, gid))
+ 		return;
+ 
++	printk(KERN_ERR "linux-hardened: %s executed by the uid/euid:%u/%u just used a SUID\n", current->comm, current_uid(), current_euid());
++
+ 	if (mode & S_ISUID) {
+ 		bprm->per_clear |= PER_CLEAR_ON_SETID;
+ 		bprm->cred->euid = uid;

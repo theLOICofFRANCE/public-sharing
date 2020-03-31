@@ -1,0 +1,50 @@
+From 9afa9bc4a01a9e990db7bd3ec74980cb337f745a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Lo=C3=AFc?= <4661917+HacKurx@users.noreply.github.com>
+Date: Fri, 21 Dec 2018 16:58:16 +0100
+Subject: [PATCH] Add equivalent to GRKERNSEC_MODHARDEN
+
+This code is modified from Brad Spengler/PaX Team's code in the last
+public patch of grsecurity/PaX based on my understanding of the code. Changes
+or omissions from the original code are mine and don't reflect the original
+grsecurity/PaX code.
+
+
+Module auto-loading in response to use of some
+feature implemented by an unloaded module will be restricted to
+root users.  Enabling this option helps defend against attacks
+by unprivileged users who abuse the auto-loading behavior to
+cause a vulnerable module to load that is then exploited.
+
+If this option prevents a legitimate use of auto-loading for a
+non-root user, the administrator can execute modprobe manually
+with the exact name of the module mentioned in the alert log.
+Alternatively, the administrator can add the module to the list
+of modules loaded at boot by modifying init scripts.
+
+Modification of init scripts will most likely be needed on
+Ubuntu servers with encrypted home directory support enabled,
+as the first non-root user logging in will cause the ecb(aes),
+ecb(aes)-all, cbc(aes), and cbc(aes)-all  modules to be loaded.
+---
+ kernel/kmod.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/kernel/kmod.c b/kernel/kmod.c
+index bc6addd9152b..8bf6cee3112d 100644
+--- a/kernel/kmod.c
++++ b/kernel/kmod.c
+@@ -149,6 +149,14 @@ int __request_module(bool wait, const char *fmt, ...)
+ 	if (ret)
+ 		return ret;
+ 
++	// equivalent to GRKERNSEC_MODHARDEN
++	if (uid_eq(current_uid(), GLOBAL_ROOT_UID)) {
++		printk(KERN_ERR
++			"warning: denied kernel module auto-load of %s\n",
++			module_name);
++		return -EPERM;
++	}
++
+ 	if (atomic_dec_if_positive(&kmod_concurrent_max) < 0) {
+ 		pr_warn_ratelimited("request_module: kmod_concurrent_max (%u) close to 0 (max_modprobes: %u), for module %s, throttling...",
+ 				    atomic_read(&kmod_concurrent_max),

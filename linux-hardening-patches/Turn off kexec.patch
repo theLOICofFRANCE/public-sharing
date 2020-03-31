@@ -1,0 +1,11 @@
+--- a/kernel/kexec_core.c	2018-12-18 03:21:00.000000000 +0100
++++ b/kernel/kexec_core.c	2020-03-31 12:14:50.180349118 +0200
+@@ -917,7 +917,7 @@ int kimage_load_segment(struct kimage *i
+ 
+ struct kimage *kexec_image;
+ struct kimage *kexec_crash_image;
+-int kexec_load_disabled;
++int kexec_load_disabled = 1;
+ 
+ /*
+  * No panic_cpu check version of crash_kexec().  This function is called

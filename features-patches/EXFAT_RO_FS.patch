@@ -1,0 +1,4206 @@
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 62b61b4fe30a..f1299dabe58e 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -6162,6 +6162,12 @@ M: Valdis Kletnieks <valdis.kletnieks@xxxxxx>
+S: Maintained
+F: drivers/staging/exfat/
+
++EXFAT READ-ONLY FILESYSTEM
++M: Konstantin Komarov <almaz.alexandrovich@xxxxxxxxxxxxxxxxxxxx>
++W: http://www.paragon-software.com/
++S: Maintained
++F: fs/exfat/
++
+EXT2 FILE SYSTEM
+M: Jan Kara <jack@xxxxxxxx>
+L: linux-ext4@xxxxxxxxxxxxxxx
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 2501e6f1f965..e0693092f331 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -139,10 +139,11 @@ endmenu
+endif # BLOCK
+
+if BLOCK
+-menu "DOS/FAT/NT Filesystems"
++menu "DOS/FAT/exFAT/NT Filesystems"
+
+source "fs/fat/Kconfig"
+source "fs/ntfs/Kconfig"
++source "fs/exfat/Kconfig"
+
+endmenu
+endif # BLOCK
+diff --git a/fs/exfat/Kconfig b/fs/exfat/Kconfig
+new file mode 100644
+index 000000000000..da360dc15357
+--- /dev/null
++++ b/fs/exfat/Kconfig
+@@ -0,0 +1,31 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config EXFAT_RO_FS
++ tristate "exFAT fs support read only"
++ default n
++ select NLS
++ help
++ exFAT file system implementation based on the specification
++ <https://docs.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
++ If you say Y here, you will be able to mount exFAT volumes.
++ Currently Read-Only support is available. Write support will be added soon.
++
++config EXFAT_RO_FS_DEFAULT_CODEPAGE
++ int "Default codepage for exFAT"
++ depends on EXFAT_RO_FS
++ default 437
++ help
++ This option should be set to the codepage of your exFAT filesystems.
++ It can be overridden with the "codepage" mount option.
++
++config EXFAT_RO_FS_DEFAULT_UTF8
++ bool "Enable exFAT UTF-8 option by default"
++ depends on EXFAT_RO_FS
++ default n
++ help
++ Set this if you would like to have "utf8" mount option set
++ by default when mounting exFAT filesystems.
++
++ Even if you say Y here can always disable UTF-8 for
++ particular mount by adding "utf8=0" to mount options.
++
++ Say Y if you use UTF-8 encoding for file names, N otherwise.
+diff --git a/fs/exfat/Makefile b/fs/exfat/Makefile
+new file mode 100644
+index 000000000000..39f0f75e790e
+--- /dev/null
++++ b/fs/exfat/Makefile
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for the Linux exfat filesystem support.
++#
++
++obj-$(CONFIG_EXFAT_RO_FS) += exfat.o
++
++exfat-objs := super.o bitmap.o upcase.o file.o fatent.o inode.o \
++ namei.o cache.o dir.o
+diff --git a/fs/exfat/bitmap.c b/fs/exfat/bitmap.c
+new file mode 100644
+index 000000000000..67b0dd499eb2
+--- /dev/null
++++ b/fs/exfat/bitmap.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/bitmap.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/fs.h>
++#include <linux/blkdev.h>
++#include <linux/sched/signal.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++#define BITS_IN_SIZE_T (sizeof(size_t) * 8)
++#define MINUS_ONE_T ((size_t)(-1))
++
++/* scan bitmap pages, lcn - zero based */
++static int exfat_scan_bitmap(struct super_block *sb, u32 lcn, u32 len,
++ int (*func)(struct super_block *sb,
++ struct page *page, u32 bit0, u32 bits,
++ void *arg),
++ void *arg)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct inode *inode = sbi->bitmap_inode;
++ u32 end = lcn + len;
++ u32 index_end = (((lcn + len) >> 3) + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ int err = 0;
++ u32 index;
++
++ for (index = lcn >> (3 + PAGE_SHIFT); index < index_end; index++) {
++ u32 next = (index + 1) << PAGE_SHIFT;
++ struct page *page =
++ read_mapping_page(inode->i_mapping, index, NULL);
++ if (IS_ERR(page)) {
++ err = PTR_ERR(page);
++ goto out;
++ }
++ kmap(page);
++ if (PageError(page)) {
++ kunmap(page);
++ put_page(page);
++ err = -EIO;
++ goto out;
++ }
++
++ if (next > end)
++ next = end;
++
++ err = (*func)(sb, page, lcn, next - lcn, arg);
++
++ flush_dcache_page(page);
++ kunmap(page);
++ put_page(page);
++
++ if (err == 1) {
++ err = 0; /* 1 means stop scanning */
++ goto out;
++ }
++
++ if (err)
++ goto out;
++
++ if (next >= end)
++ goto out;
++
++ lcn = next;
++ }
++
++out:
++ return err;
++}
++
++static int exfat_on_get_used(struct super_block *sb, struct page *page,
++ u32 bit0, u32 bits, void *arg)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ const unsigned long *wnd = page_address(page);
++ u32 used = __bitmap_weight(wnd, bits);
++
++ if (sbi->first_free_cluster == ~0u && used < bits) {
++ u32 i, bit = bit0 & (PAGE_SIZE * 8 - 1);
++
++ bit0 &= ~(PAGE_SIZE * 8 - 1);
++ for (i = 0; i < bits; i++, bit++) {
++ if (!test_bit(bit, wnd)) {
++ sbi->first_free_cluster = bit + bit0;
++ break;
++ }
++ }
++ }
++
++ (*(u32 *)arg) += used;
++ return 0;
++}
++
++int exfat_count_free_clusters(struct super_block *sb)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ int err = 0;
++ u32 used = 0;
++
++ lock_exfat(sbi);
++
++ if (~0 == sbi->free_clusters) {
++ err = exfat_scan_bitmap(sb, 0, sbi->clusters,
++ &exfat_on_get_used, &used);
++ if (!err)
++ sbi->free_clusters = sbi->clusters - used;
++ }
++
++ unlock_exfat(sbi);
++ return err;
++}
+diff --git a/fs/exfat/cache.c b/fs/exfat/cache.c
+new file mode 100644
+index 000000000000..05b3f718c1fa
+--- /dev/null
++++ b/fs/exfat/cache.c
+@@ -0,0 +1,483 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/cache.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/fs.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++struct exfat_run_rb {
++ struct rb_node rb_node;
++ u32 vcn; /* virtual cluster number */
++ u32 len; /* length of extent in clusters */
++ u32 lcn; /* logical cluster number */
++};
++
++static struct kmem_cache *exfat_run_cachep;
++
++int __init exfat_run_cache_init(void)
++{
++ exfat_run_cachep = kmem_cache_create("exfat_run_cache",
++ sizeof(struct exfat_run_rb), 0,
++ SLAB_RECLAIM_ACCOUNT, NULL);
++ return exfat_run_cachep ? 0 : -ENOMEM;
++}
++
++void exfat_run_cache_exit(void)
++{
++ kmem_cache_destroy(exfat_run_cachep);
++}
++
++static inline struct exfat_run_rb *run_tree_search(struct rb_root *root,
++ u32 vcn)
++{
++ struct rb_node *node = root->rb_node;
++ struct exfat_run_rb *er = NULL;
++
++ while (node) {
++ er = rb_entry(node, struct exfat_run_rb, rb_node);
++ if (vcn < er->vcn)
++ node = node->rb_left;
++ else if (vcn > (er->vcn + er->len - 1))
++ node = node->rb_right;
++ else
++ return er;
++ }
++
++ if (er && vcn < er->vcn)
++ return er;
++
++ if (er && vcn > (er->vcn + er->len - 1)) {
++ node = rb_next(&er->rb_node);
++ if (node)
++ return rb_entry(node, struct exfat_run_rb, rb_node);
++ }
++
++ return NULL;
++}
++
++static inline int can_be_merged(const struct exfat_run_rb *left,
++ const struct exfat_run_rb *right)
++{
++ return left->vcn + left->len == right->vcn &&
++ left->lcn + left->len == right->lcn;
++}
++
++static inline struct exfat_run_rb *try_left(struct exfat_runs_tree *tree,
++ struct exfat_run_rb *er)
++{
++ struct exfat_run_rb *left;
++ struct rb_node *node;
++
++ node = rb_prev(&er->rb_node);
++ if (!node)
++ return er;
++
++ left = rb_entry(node, struct exfat_run_rb, rb_node);
++ if (can_be_merged(left, er)) {
++ left->len += er->len;
++ rb_erase(&er->rb_node, &tree->root);
++ kmem_cache_free(exfat_run_cachep, er);
++ er = left;
++ }
++
++ return er;
++}
++
++static struct exfat_run_rb *try_right(struct exfat_runs_tree *tree,
++ struct exfat_run_rb *er)
++{
++ struct exfat_run_rb *right;
++ struct rb_node *node;
++
++ node = rb_next(&er->rb_node);
++ if (!node)
++ return er;
++
++ right = rb_entry(node, struct exfat_run_rb, rb_node);
++ if (can_be_merged(er, right)) {
++ er->len += right->len;
++ rb_erase(node, &tree->root);
++ kmem_cache_free(exfat_run_cachep, right);
++ }
++
++ return er;
++}
++
++static int run_insert(struct exfat_runs_tree *tree,
++ const struct exfat_run_rb *run)
++{
++ struct rb_node **p = &tree->root.rb_node;
++ struct rb_node *parent = NULL;
++ struct exfat_run_rb *er;
++
++ while (*p) {
++ parent = *p;
++ er = rb_entry(parent, struct exfat_run_rb, rb_node);
++
++ if (run->vcn < er->vcn) {
++ if (can_be_merged(run, er)) {
++ /* Run merged as left. */
++ er->vcn = run->vcn;
++ er->len += run->len;
++ er->lcn = run->lcn;
++ er = try_left(tree, er);
++ goto out;
++ }
++
++ p = &(*p)->rb_left;
++ } else if (run->vcn > (er->vcn + er->len - 1)) {
++ if (can_be_merged(er, run)) {
++ /* Run merged as right.*/
++ er->len += run->len;
++ er = try_right(tree, er);
++ goto out;
++ }
++ p = &(*p)->rb_right;
++ } else {
++ WARN_ON(1);
++ return -ENOENT;
++ }
++ }
++
++ er = kmem_cache_alloc(exfat_run_cachep, GFP_ATOMIC);
++ if (!er)
++ return -ENOMEM;
++
++ er->vcn = run->vcn;
++ er->len = run->len;
++ er->lcn = run->lcn;
++
++ rb_link_node(&er->rb_node, parent, p);
++ rb_insert_color(&er->rb_node, &tree->root);
++
++out:
++ tree->cache_er = er;
++ return 0;
++}
++
++/* remove range [vcn end] */
++static int run_remove_from_to(struct exfat_runs_tree *tree, u32 vcn, u32 end)
++{
++ struct rb_node *node;
++ struct exfat_run_rb *er;
++ struct exfat_run_rb orig_er;
++ u32 len1, len2;
++ int err;
++
++ er = run_tree_search(&tree->root, vcn);
++ if (!er)
++ return 0;
++
++ if (er->vcn > end)
++ return 0;
++
++ tree->cache_er = NULL;
++
++ orig_er.vcn = er->vcn;
++ orig_er.len = er->len;
++ orig_er.lcn = er->lcn;
++
++ len1 = vcn > er->vcn ? vcn - er->vcn : 0;
++ len2 = (er->vcn + er->len - 1) > end ? (er->vcn + er->len - 1) - end :
++ 0;
++ if (len1 > 0)
++ er->len = len1;
++ if (len2 > 0) {
++ if (len1 > 0) {
++ struct exfat_run_rb run;
++
++ run.vcn = end + 1;
++ run.len = len2;
++ run.lcn = orig_er.lcn + orig_er.len - len2;
++ err = run_insert(tree, &run);
++ if (err) {
++ er->vcn = orig_er.vcn;
++ er->len = orig_er.len;
++ }
++ return err;
++
++ } else {
++ er->vcn = end + 1;
++ er->len = len2;
++ er->lcn = orig_er.lcn + orig_er.len - len2;
++ return 0;
++ }
++ }
++
++ err = 0;
++ if (len1 > 0) {
++ node = rb_next(&er->rb_node);
++ if (node)
++ er = rb_entry(node, struct exfat_run_rb, rb_node);
++ else
++ er = NULL;
++ }
++
++ while (er && (er->vcn + er->len - 1) <= end) {
++ node = rb_next(&er->rb_node);
++ rb_erase(&er->rb_node, &tree->root);
++ kmem_cache_free(exfat_run_cachep, er);
++ if (!node) {
++ er = NULL;
++ break;
++ }
++ er = rb_entry(node, struct exfat_run_rb, rb_node);
++ }
++ if (er && er->vcn < end + 1) {
++ u32 orig_len = er->len;
++
++ len1 = (er->vcn + er->len - 1) - end;
++ er->vcn = end + 1;
++ er->len = len1;
++ er->lcn = er->lcn + orig_len - len1;
++ }
++
++ return err;
++}
++
++static int exfat_tree_insert_run(struct exfat_runs_tree *tree, u32 vcn, u32 lcn,
++ u32 len)
++{
++ u32 end;
++ int err;
++ struct exfat_run_rb run;
++
++ WARN_ON(!len);
++ if (!len)
++ return 0;
++
++ end = vcn + len - 1;
++ WARN_ON(end < vcn);
++ run.vcn = vcn;
++ run.len = len;
++ run.lcn = lcn;
++
++ err = run_remove_from_to(tree, vcn, end);
++ if (!err)
++ err = run_insert(tree, &run);
++
++ return err;
++}
++
++/* adds run to an inode's run's tree.*/
++int exfat_insert_run(struct inode *inode, u32 vcn, u32 lcn, u32 len)
++{
++ struct exfat_inode_info *ei = exfat_i(inode);
++ struct exfat_runs_tree *tree = &ei->i_runs_tree;
++ int err;
++
++ write_lock(&ei->i_run_lock);
++
++ err = exfat_tree_insert_run(tree, vcn, lcn, len);
++
++ write_unlock(&ei->i_run_lock);
++
++ return err;
++}
++
++/* remove a run from a run tree */
++int exfat_remove_run(struct inode *inode, u32 vcn)
++{
++ struct exfat_inode_info *ei = exfat_i(inode);
++ int err;
++
++ write_lock(&ei->i_run_lock);
++ err = run_remove_from_to(&ei->i_runs_tree, vcn, ~0u);
++ write_unlock(&ei->i_run_lock);
++
++ return err;
++}
++
++static bool lookup_run(struct inode *inode, u32 vcn, struct exfat_run_rb *er)
++{
++ struct exfat_inode_info *ei = exfat_i(inode);
++ struct exfat_runs_tree *tree = &ei->i_runs_tree;
++ struct exfat_run_rb *er1 = NULL;
++ struct rb_node *node;
++ bool found = false;
++
++ read_lock(&ei->i_run_lock);
++
++ /* check cache */
++ if (tree->cache_er) {
++ er1 = tree->cache_er;
++ if (vcn >= er1->vcn && vcn <= er1->vcn + er1->len - 1) {
++ found = true;
++ goto out;
++ }
++ }
++
++ node = tree->root.rb_node;
++ while (node) {
++ er1 = rb_entry(node, struct exfat_run_rb, rb_node);
++ if (vcn < er1->vcn)
++ node = node->rb_left;
++ else if (vcn > (er1->vcn + er1->len - 1))
++ node = node->rb_right;
++ else {
++ found = true;
++ break;
++ }
++ }
++
++out:
++ if (found) {
++ er->vcn = er1->vcn;
++ er->len = er1->len;
++ er->lcn = er1->lcn;
++ }
++
++ read_unlock(&ei->i_run_lock);
++
++ return found;
++}
++
++/* Translate virtual cluster number into logical cluster number */
++int exfat_vcn_to_lcn(struct inode *inode, u32 vcn, u32 *len, u32 *lcn)
++{
++ struct exfat_inode_info *ei = exfat_i(inode);
++ struct exfat_run_rb er;
++ u32 dlen;
++ int err;
++
++ read_lock(&ei->i_run_lock);
++ err = !ei->i_runs_tree.root.rb_node && inode->i_blocks;
++ read_unlock(&ei->i_run_lock);
++
++ if (err) {
++ /* tree is not loaded yet */
++ err = exfat_load_runs(inode, NULL);
++ if (err)
++ return err;
++ }
++
++ if (!lookup_run(inode, vcn, &er))
++ return -ENOENT;
++
++ dlen = vcn - er.vcn;
++ WARN_ON(vcn < er.vcn);
++ *lcn = er.lcn + dlen;
++ *len = er.len - dlen;
++ return 0;
++}
++
++/* translates virtual byte offset into physical byte offset */
++int exfat_vbo_to_pbo(struct inode *inode, u64 vbo, u64 *pbo, u64 *bytes)
++{
++ struct super_block *sb = inode->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ u32 vcn = vbo >> sbi->cluster_bits;
++ u32 offset = vbo & sbi->cluster_mask;
++ u32 len, lcn;
++ int err;
++
++ err = exfat_vcn_to_lcn(inode, vcn, &len, &lcn);
++ if (err)
++ return err;
++
++ if (lcn == EXFAT_CLUSTER_EOF) {
++ exfat_fs_error(sb, "r=%lx: vcn=%x beyond EOF", inode->i_ino,
++ vcn);
++ return -ENOENT;
++ }
++
++ *pbo = exfat_lcn_to_pbo(sbi, lcn) + offset;
++ *bytes = ((u64)len << sbi->cluster_bits) - offset;
++
++ return 0;
++}
++
++/*fills run's tree*/
++int exfat_load_runs(struct inode *inode, u32 *len)
++{
++ struct super_block *sb = inode->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(inode);
++ u32 vcn, next_lcn, tmp;
++ u32 uninitialized_var(flcn), uninitialized_var(fvcn), flen = 0;
++ u32 lcn = ei->i_lcn0;
++ int err;
++ struct exfat_entry exfat_entry;
++ u32 alen = inode->i_blocks >> (sbi->cluster_bits - 9);
++
++ if (!len)
++ len = &tmp;
++
++ if (ei->i_runs_tree.root.rb_node) {
++ *len = alen;
++ return 0;
++ }
++
++ if (FlagOn(ei->i_stream_flags, ENTRY_FLAG_CONTINUES)) {
++ WARN_ON(inode->i_ino == EXFAT_ROOT_INO);
++ err = exfat_insert_run(inode, 0, lcn, alen);
++ if (err)
++ return err;
++
++ *len = alen;
++ return 0;
++ }
++
++ exfat_entry_init(&exfat_entry);
++
++ for (vcn = 0;; vcn++, lcn = next_lcn) {
++ if (lcn == EXFAT_CLUSTER_EOF) {
++ *len = vcn;
++ err = 0;
++ break;
++ }
++
++ if (vcn > sbi->clusters) {
++ exfat_fs_error_ratelimit(
++ sb, "detected the cluster chain loop, pos %llx",
++ ei->i_pos[0]);
++ err = -ENOENT;
++ break;
++ }
++
++ err = exfat_fat_get(sb, &exfat_entry, lcn, &next_lcn);
++ if (err)
++ break;
++
++ if (next_lcn == EXFAT_CLUSTER_FREE) {
++ exfat_fs_error_ratelimit(
++ sb, "invalid cluster chain, pos %llx",
++ ei->i_pos[0]);
++ err = -ENOENT;
++ break;
++ }
++
++ if (!flen) {
++ fvcn = vcn;
++ flen = 1;
++ flcn = lcn;
++ } else if (lcn == flcn + flen) {
++ flen += 1;
++ } else {
++ err = exfat_insert_run(inode, fvcn, flcn, flen);
++ if (err) {
++ flen = 0;
++ WARN_ON(-ENOENT != err && -ENOMEM != err);
++ break;
++ }
++ fvcn = vcn;
++ flen = 1;
++ flcn = lcn;
++ }
++ }
++
++ /* last fragment */
++ if (flen)
++ err = exfat_insert_run(inode, fvcn, flcn, flen);
++
++ exfat_entry_end(&exfat_entry);
++
++ return err;
++}
+diff --git a/fs/exfat/debug.h b/fs/exfat/debug.h
+new file mode 100644
+index 000000000000..87ce3d210a70
+--- /dev/null
++++ b/fs/exfat/debug.h
+@@ -0,0 +1,69 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * linux/fs/exfat/debug.h
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ * useful functions for debuging
++ */
++
++#include <linux/slab.h>
++
++#define SetFlag(flags, single_flag) (flags |= (single_flag))
++#define ClearFlag(flags, single_flag) (flags &= ~(single_flag))
++#define FlagOn(flags, single_flag) (0 != ((flags) & (single_flag)))
++
++#ifndef Add2Ptr
++#define Add2Ptr(P, I) ((u8 *)(P) + (I))
++#define PtrOffset(B, O) ((size_t)((size_t)(O) - (size_t)(B)))
++#endif
++
++#ifndef QuadAlign
++#define QuadAlign(n) (((n) + 7u) & (~7u))
++#define IsQuadAligned(n) (0 == ((size_t)(n)&7u))
++#define Quad2Align(n) (((n) + 15u) & (~15u))
++#define IsQuad2Aligned(n) (0 == ((size_t)(n)&15u))
++#define Quad4Align(n) (((n) + 31u) & (~31u))
++#define IsSizeTAligned(n) (0 == ((size_t)(n) & (sizeof(size_t) - 1)))
++#define DwordAlign(n) (((n) + 3u) & (~3u))
++#define IsDwordAligned(n) (0 == ((size_t)(n)&3u))
++#define WordAlign(n) (((n) + 1u) & (~1u))
++#define IsWordAligned(n) (0 == ((size_t)(n)&1u))
++#endif
++
++#define exfat_trace(sb, fmt, args...) \
++ __exfat_trace(sb, KERN_NOTICE, fmt, ##args)
++__printf(3, 4) void __exfat_trace(const struct super_block *sb,
++ const char *level, const char *fmt, ...);
++#define exfat_warning(sb, fmt, args...) \
++ __exfat_trace(sb, KERN_WARNING, fmt, ##args)
++
++void exfat_dump_mem(const void *Mem, size_t nBytes);
++
++#define exfat_fs_error(sb, fmt, args...) __exfat_fs_error(sb, 1, fmt, ##args)
++void __exfat_fs_error(struct super_block *sb, int report, const char *fmt, ...);
++
++#define exfat_trace_ratelimit(sb, level, fmt, args...) \
++ do { \
++ if (__ratelimit(&exfat_sb(sb)->ratelimit)) \
++ __exfat_trace(sb, level, fmt, ##args); \
++ } while (0)
++
++#define exfat_fs_error_ratelimit(sb, fmt, args...) \
++ __exfat_fs_error(sb, __ratelimit(&exfat_sb(sb)->ratelimit), fmt, ##args)
++
++static inline void *exfat_heap_alloc(unsigned long size, int zero)
++{
++ void *ptr = kmalloc(size, zero ? (GFP_NOFS | __GFP_ZERO) : GFP_NOFS);
++
++ WARN_ON(!ptr);
++ return ptr;
++}
++
++static inline void exfat_heap_free(void *p)
++{
++ if (!p)
++ return;
++ WARN_ON((size_t)p >= VMALLOC_START && (size_t)p < VMALLOC_END);
++ kfree(p);
++}
+diff --git a/fs/exfat/dir.c b/fs/exfat/dir.c
+new file mode 100644
+index 000000000000..2ce093a8ccc1
+--- /dev/null
++++ b/fs/exfat/dir.c
+@@ -0,0 +1,610 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/dir.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ * directory handling functions for exfat-based filesystems
++ *
++ */
++
++#include <linux/fs.h>
++#include <linux/blkdev.h>
++#include <linux/iversion.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++static inline u64 exfat_make_i_pos(struct super_block *sb,
++ struct buffer_head *bh,
++ const union exfat_direntry *de)
++{
++ return ((u64)bh->b_blocknr << sb->s_blocksize_bits) +
++ PtrOffset(bh->b_data, de);
++}
++
++static inline int exfat_get_entry(struct inode *dir, u32 *vbo,
++ struct buffer_head **bh,
++ union exfat_direntry **de)
++{
++ struct super_block *sb = dir->i_sb;
++ struct buffer_head *b = *bh;
++ union exfat_direntry *d = *de;
++ struct blk_plug plug;
++ u64 pbo, bytes;
++ int err;
++ sector_t i, pbn, pbn_end;
++
++ if (b && d) {
++ size_t off = PtrOffset(b->b_data, d);
++
++ if (off + sizeof(union exfat_direntry) < sb->s_blocksize) {
++ *vbo += sizeof(union exfat_direntry);
++ *de = d + 1;
++ return 0;
++ }
++ WARN_ON(*vbo & (sb->s_blocksize - 1));
++ }
++
++ brelse(b);
++ *bh = NULL;
++
++ if (*vbo >= exfat_i(dir)->i_valid)
++ return -ENOENT;
++
++ err = exfat_vbo_to_pbo(dir, *vbo, &pbo, &bytes);
++ if (err)
++ return err;
++
++ pbn = pbo >> sb->s_blocksize_bits;
++ pbn_end = (pbo + bytes) >> sb->s_blocksize_bits;
++
++ blk_start_plug(&plug);
++ for (i = pbn; i < pbn_end; i++)
++ sb_breadahead(sb, i);
++ blk_finish_plug(&plug);
++
++ b = exfat_bread(sb, pbn);
++ if (!b)
++ return -EIO;
++
++ *de = (union exfat_direntry *)(b->b_data +
++ (*vbo & (sb->s_blocksize - 1)));
++ *vbo += sizeof(union exfat_direntry);
++ *bh = b;
++
++ return 0;
++}
++
++/*
++ * Convert little endian Unicode 16 to UTF-8.
++ */
++static inline int exfat_uni_to_x8(struct super_block *sb, const __le16 *uni,
++ u8 *buf, int len)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ const __le16 *ip;
++ u8 *op;
++ struct nls_table *nls;
++
++ if (sbi->options.utf8)
++ return utf16s_to_utf8s(uni, MAX_EXFAT_FILENAME,
++ UTF16_LITTLE_ENDIAN, buf, len);
++
++ ip = uni;
++ op = buf;
++ nls = sbi->nls;
++
++ while (*ip && ((len - NLS_MAX_CHARSET_SIZE) > 0)) {
++ u16 ec = le16_to_cpu(*ip++);
++ int charlen = nls->uni2char(ec, op, NLS_MAX_CHARSET_SIZE);
++
++ if (charlen > 0) {
++ op += charlen;
++ len -= charlen;
++ } else {
++ if (sbi->options.unicode_xlate) {
++ *op++ = ':';
++ op = hex_byte_pack(op, ec >> 8);
++ op = hex_byte_pack(op, ec);
++ len -= 5;
++ } else {
++ *op++ = '?';
++ len--;
++ }
++ }
++ }
++
++ if (unlikely(*ip))
++ exfat_warning(sb, "filename was truncated while converting.");
++
++ *op = 0;
++ return op - buf;
++}
++
++static int exfat_get_name(struct inode *dir, u32 *vbo, struct buffer_head **bh,
++ union exfat_direntry **de, __le16 **unicode,
++ u8 name_len, struct exfat_slot_info *sinfo)
++{
++ __le16 *p = *unicode;
++ u32 len;
++ union exfat_direntry *n;
++
++ if (!p) {
++ *unicode = p = __getname();
++ if (!p) {
++ brelse(*bh);
++ *bh = NULL;
++ return -ENOMEM;
++ }
++ }
++ for (;;) {
++ int err = exfat_get_entry(dir, vbo, bh, de);
++
++ if (err)
++ return err;
++
++ n = *de;
++
++ if (n->type != ENTRY_TYPE_NAME)
++ return -ENOENT;
++
++ if (sinfo) {
++ struct buffer_head **sbh = &sinfo->bh[sinfo->nbh];
++
++ WARN_ON(sinfo->nbh < 1);
++ if (sbh[-1] != *bh) {
++ WARN_ON(sinfo->nbh >= ARRAY_SIZE(sinfo->bh));
++ sinfo->pos[sinfo->nbh] =
++ exfat_make_i_pos(dir->i_sb, *bh, *de);
++ brelse(*sbh);
++ *sbh = *bh;
++ get_bh(*bh);
++ sinfo->nbh += 1;
++ }
++ }
++
++ // little endian unicode string
++ len = min_t(unsigned int, name_len, ARRAY_SIZE(n->name.name));
++ memcpy(p, n->name.name, len * sizeof(*p));
++ p += len;
++
++ name_len -= len;
++ if (!name_len)
++ break;
++ }
++
++ *p = 0;
++ return 0;
++}
++
++/* Converts the specified Unicode character to uppercase*/
++/* It uses the uncompressed form of upcase_tbl */
++static inline u16 upcase_unicode_char(const u16 *upcase_tbl, u16 chr)
++{
++ if (chr < 'a')
++ return chr;
++
++ if (chr <= 'z')
++ return (u16)(chr - ('a' - 'A'));
++
++ return upcase_tbl[chr];
++}
++
++/* Calculates hame hash */
++u16 exfat_name_hash(const __le16 *name, u32 len, const u16 *upcase_tbl)
++{
++ u16 hash = 0;
++
++ while (len--) {
++ u16 upc = upcase_unicode_char(upcase_tbl, le16_to_cpu(*name++));
++
++ hash = exfat_check_sum_16(exfat_check_sum_16(hash, (u8)upc),
++ (u8)(upc >> 8));
++ }
++
++ return hash;
++}
++
++/* helper function */
++int exfat_search(struct inode *dir, const struct qstr *name,
++ struct exfat_slot_info *sinfo)
++{
++ struct super_block *sb = dir->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(dir);
++ struct buffer_head *bh = NULL;
++ union exfat_direntry *de = NULL;
++ u32 vbo = 0;
++ __le16 *ondisk_name = __getname();
++ __le16 *uname = ondisk_name + MAX_EXFAT_FILENAME + 1;
++ u8 ondisk_len;
++ int err, ulen;
++ __le16 hash;
++
++ memset(sinfo, 0, sizeof(*sinfo)); /* TODO: reduce initialization*/
++
++ if (!ondisk_name)
++ return -ENOMEM;
++
++ /* Convert input string to little endian unicode */
++ err = xlate_to_uni(name->name, name->len, uname, 1, sbi->options.utf8,
++ sbi->nls);
++ if (err < 0)
++ goto out;
++ ulen = err;
++
++ hash = cpu_to_le16(exfat_name_hash(uname, ulen, sbi->upcase_tbl));
++
++ for (;;) {
++ err = exfat_get_entry(dir, &vbo, &bh, &de);
++ if (err)
++ break;
++
++ if (de->type == ENTRY_TYPE_NEVER_USED) {
++ err = -ENOENT;
++ break;
++ }
++
++ if (de->type != ENTRY_TYPE_NORMAL)
++ continue;
++
++ if (de->norm.subentries < 1 ||
++ de->norm.subentries > MAX_SUBENTRIES_PER_NAME) {
++ exfat_fs_error_ratelimit(
++ sb,
++ "incorrect number of subentries %u in dir %llx",
++ ei->i_pos[0]);
++ continue;
++ }
++
++ /* save position of normal entry*/
++ sinfo->vbo = vbo - sizeof(union exfat_direntry);
++ sinfo->pos[0] = exfat_make_i_pos(sb, bh, de);
++ sinfo->de_norm = de;
++ sinfo->nr_slots = de->norm.subentries + 1;
++ sinfo->slots_norm =
++ (sb->s_blocksize - PtrOffset(bh->b_data, de)) >>
++ EXFAT_LOG2_ENTRY;
++ brelse(sinfo->bh[0]);
++ sinfo->bh[0] = bh;
++ get_bh(bh);
++ sinfo->nbh = 1;
++
++ err = exfat_get_entry(dir, &vbo, &bh, &de);
++ if (err)
++ break;
++
++ if (de->type != ENTRY_TYPE_STREAM) {
++ exfat_fs_error_ratelimit(
++ sb, "there is no expected stream in dir %llx",
++ ei->i_pos[0]);
++ continue;
++ }
++
++ if (de->stream.namehash != hash)
++ continue;
++
++ ondisk_len = de->stream.namelen;
++ if (ondisk_len != ulen)
++ continue;
++
++ /* save position*/
++ if (bh != sinfo->bh[0]) {
++ sinfo->pos[1] = exfat_make_i_pos(sb, bh, de);
++ brelse(sinfo->bh[1]);
++ sinfo->bh[1] = bh;
++ get_bh(bh);
++ sinfo->nbh = 2;
++ }
++
++ err = exfat_get_name(dir, &vbo, &bh, &de, &ondisk_name,
++ ondisk_len, sinfo);
++ if (err)
++ continue; /*or break?*/
++
++ /*Both 'ondisk_name' and 'uname' are little endian unicode*/
++ if (!memcmp(ondisk_name, uname, ondisk_len * sizeof(*uname)))
++ break;
++ }
++
++out:
++ if (ondisk_name)
++ __putname(ondisk_name);
++
++ if (err) {
++ brelse(sinfo->bh[0]);
++ brelse(sinfo->bh[1]);
++ brelse(sinfo->bh[2]);
++ sinfo->bh[0] = sinfo->bh[1] = sinfo->bh[2] = NULL;
++ }
++
++ return err;
++}
++
++/*file_operations::iterate_shared*/
++static int exfat_readdir(struct file *file, struct dir_context *ctx)
++{
++ struct inode *dir = file_inode(file);
++ struct exfat_inode_info *ei = exfat_i(dir);
++ struct super_block *sb = dir->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct buffer_head *bh = NULL;
++ u32 vbo = ctx->pos;
++ __le16 *unicode = NULL;
++ u8 name_len = 0;
++ int err = 0;
++ u32 name_vbo;
++ union exfat_direntry *de = NULL;
++ u32 dtype;
++ u64 i_pos;
++ unsigned long inum;
++ char *a_name;
++ int a_name_len;
++ struct inode *tmp;
++
++ mutex_lock(&sbi->s_lock);
++
++ if (!vbo) {
++ if (!dir_emit_dots(file, ctx))
++ goto out;
++ vbo = 1;
++ }
++
++ if (vbo == 1) {
++ if (!dir_emit_dots(file, ctx))
++ goto out;
++ vbo = 0;
++ }
++
++ if (vbo & (sizeof(union exfat_direntry) - 1)) {
++ err = -ENOENT;
++ goto out;
++ }
++
++ for (;;) {
++ err = exfat_get_entry(dir, &vbo, &bh, &de);
++ if (err)
++ break;
++
++ if (de->type == ENTRY_TYPE_NEVER_USED) {
++ err = -ENOENT;
++ break;
++ }
++
++ if (de->type != ENTRY_TYPE_NORMAL)
++ continue;
++
++ if (de->norm.subentries < 1 ||
++ de->norm.subentries > MAX_SUBENTRIES_PER_NAME) {
++ exfat_fs_error_ratelimit(
++ sb,
++ "incorrect number of subentries %u in dir %llx",
++ ei->i_pos[0]);
++ continue;
++ }
++
++ dtype = de_is_directory(de) ? DT_DIR : DT_REG;
++ name_vbo = vbo - sizeof(union exfat_direntry);
++ i_pos = exfat_make_i_pos(sb, bh, de);
++
++ err = exfat_get_entry(dir, &vbo, &bh, &de);
++ if (err)
++ break;
++
++ if (de->type != ENTRY_TYPE_STREAM) {
++ exfat_fs_error_ratelimit(
++ sb, "there is no expected stream in dir %llx",
++ ei->i_pos[0]);
++ continue;
++ }
++
++ name_len = de->stream.namelen;
++
++ err = exfat_get_name(dir, &vbo, &bh, &de, &unicode, name_len,
++ NULL);
++ if (err)
++ break;
++
++ if (!unicode[0]) {
++ exfat_fs_error_ratelimit(sb,
++ "empty name in directory %llx",
++ ei->i_pos[0]);
++ continue;
++ }
++
++ /*unicode contains little endian name*/
++ a_name = (char *)(unicode + MAX_EXFAT_FILENAME + 1);
++ a_name_len = exfat_uni_to_x8(sb, unicode, a_name,
++ PATH_MAX - MAX_EXFAT_FILENAME);
++ if (!a_name_len) {
++ exfat_warning(sb, "Failed to convert unicode string");
++ continue;
++ }
++ tmp = exfat_iget(sb, i_pos);
++ if (tmp) {
++ inum = tmp->i_ino;
++ iput(tmp);
++ } else {
++ inum = iunique(sb, EXFAT_MAX_RESERVED_INO);
++ }
++
++ if (!dir_emit(ctx, a_name, a_name_len, inum, dtype)) {
++ vbo = name_vbo; /*next readdir starts from this name*/
++ break;
++ }
++ }
++
++ brelse(bh);
++ if (unicode)
++ __putname(unicode);
++out:
++ mutex_unlock(&sbi->s_lock);
++
++ ctx->pos = vbo;
++ if (-ENOENT == err)
++ err = 0;
++
++ return err;
++}
++
++/* Counts the number of sub-directories of dir. */
++u32 exfat_subdirs(struct inode *dir)
++{
++ struct buffer_head *bh = NULL;
++ union exfat_direntry *de = NULL;
++ u32 vbo = 0;
++ u32 subdirs = 0;
++
++ while (!exfat_get_entry(dir, &vbo, &bh, &de) &&
++ de->type != ENTRY_TYPE_NEVER_USED) {
++ if (de->type == ENTRY_TYPE_NORMAL && de_is_directory(de))
++ subdirs += 1;
++ }
++
++ brelse(bh);
++
++ return subdirs;
++}
++
++static void exfat_load_label(struct super_block *sb, union exfat_direntry *de)
++{
++}
++
++static int exfat_load_bitmap(struct super_block *sb, union exfat_direntry *de,
++ u64 bytes_per_bitmap)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct inode *inode = sbi->bitmap_inode;
++ struct exfat_inode_info *ei = exfat_i(inode);
++ u64 pbo, bytes;
++ int err;
++
++ inode->i_size = bytes_per_bitmap;
++ ei->i_valid = exfat_align_up(sbi, bytes_per_bitmap);
++
++ inode_set_bytes(inode, ei->i_valid);
++ ei->i_lcn0 = le32_to_cpu(de->bitmap.start_lcn);
++
++ err = exfat_load_runs(inode, NULL);
++ if (err)
++ return err;
++
++ err = exfat_vbo_to_pbo(inode, 0, &pbo, &bytes);
++ if (err)
++ return err;
++
++ /*readahead first fragment*/
++ exfat_page_cache_readahead(inode->i_mapping, pbo >> PAGE_SHIFT,
++ bytes >> PAGE_SHIFT);
++ return 0;
++}
++
++/*Scans root directory and initialize necessary metafiles*/
++/*It is a part of exfat_fill_super*/
++int exfat_scan_root(struct super_block *sb)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct inode *root_inode = sb->s_root->d_inode;
++ struct buffer_head *bh = NULL;
++ union exfat_direntry *de = NULL;
++ u32 vbo = 0;
++ u32 sub_dirs_count = 0;
++ int err = 0;
++ u64 bytes_per_bitmap = 0;
++
++ static_assert(BOOT_FLAG_SECFAT == ENTRY_FLAG_SECBITMAP);
++
++ sbi->label_off = ~0u;
++ for (;;) {
++ err = exfat_get_entry(root_inode, &vbo, &bh, &de);
++ if (err)
++ break;
++
++ if (de->type == ENTRY_TYPE_NEVER_USED)
++ break;
++
++ switch (de->type) {
++ case ENTRY_TYPE_BITMAP:
++ if (FlagOn(de->bitmap.flags, ENTRY_FLAG_SECBITMAP)) {
++ exfat_trace(sb, "Only one bitmap supported");
++ err = -EINVAL;
++ goto out;
++ } else if (bytes_per_bitmap) {
++ exfat_trace(sb, "Two or more Bitmaps");
++ err = -EINVAL;
++ goto out;
++ }
++
++ bytes_per_bitmap = le64_to_cpu(de->bitmap.size);
++ if (bytes_per_bitmap * 8 < sbi->clusters) {
++ exfat_trace(
++ sb,
++ "Bitmap size %llx is too small to keep all clusters",
++ bytes_per_bitmap);
++ err = -EINVAL;
++ goto out;
++ }
++ err = exfat_load_bitmap(sb, de, bytes_per_bitmap);
++ if (err)
++ goto out;
++ break;
++
++ case ENTRY_TYPE_UPCASE:
++ if (sbi->upcase_tbl) {
++ exfat_trace(sb, "Two or more Upcases");
++ err = -EINVAL;
++ goto out;
++ }
++
++ err = exfat_load_upcase(sb, de, true);
++ if (err)
++ goto out;
++ WARN_ON(!sbi->upcase_tbl);
++ break;
++
++ case ENTRY_TYPE_LABEL:
++ if (~0u != sbi->label_off) {
++ exfat_trace(sb, "Two or more Labels");
++ err = -EINVAL;
++ goto out;
++ }
++ exfat_load_label(sb, de);
++ /* Save current entry */
++ sbi->label_off = vbo - sizeof(union exfat_direntry);
++ break;
++
++ case ENTRY_TYPE_NORMAL:
++ if (de_is_directory(de))
++ sub_dirs_count += 1;
++ break;
++ }
++ }
++ brelse(bh);
++
++ set_nlink(root_inode, sub_dirs_count + 2);
++
++ if (!sbi->upcase_tbl) {
++ exfat_trace(sb, "No upcase found in root");
++ err = -EINVAL;
++ goto out;
++ }
++
++ if (!bytes_per_bitmap) {
++ exfat_trace(sb, "No bitmap found in root");
++ err = -EINVAL;
++ goto out;
++ }
++
++ err = exfat_count_free_clusters(sb);
++
++out:
++ return err;
++}
++
++const struct file_operations exfat_dir_operations = {
++ .llseek = generic_file_llseek,
++ .read = generic_read_dir,
++ .iterate_shared = exfat_readdir,
++};
+diff --git a/fs/exfat/exfat.h b/fs/exfat/exfat.h
+new file mode 100644
+index 000000000000..395ba3b42533
+--- /dev/null
++++ b/fs/exfat/exfat.h
+@@ -0,0 +1,248 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * linux/fs/exfat/exfat.h
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ * on-disk exfat structs
++ */
++
++#define MAIN_BOOT_SECTOR 0
++#define MAIN_EXBOOT_SECTOR 1
++#define MAIN_OEM_SECTOR 9
++#define MAIN_CHKSUM_SECTOR 11
++
++#define BACKUP_BOOT_SECTOR 12
++#define BACKUP_EXBOOT_SECTOR 13
++#define BACKUP_OEM_SECTOR 21
++#define BACKUP_CHKSUM_SECTOR 23
++
++#define SECTORS_PER_BOOT (BACKUP_CHKSUM_SECTOR + 1)
++
++/* exfat_boot.ex_flags_lo bits */
++#define BOOT_FLAG_SECFAT 0x01
++#define BOOT_FLAG_DIRTY 0x02
++#define BOOT_FLAG_BAD_BLOCKS 0x04
++
++#define ENTRY_TYPE_VALUE_MASK 0x1F
++#define ENTRY_TYPE_BENING_MASK 0x20
++#define ENTRY_TYPE_SECONDARY_MASK 0x40
++#define ENTRY_TYPE_USED_MASK 0x80
++
++#define ENTRY_TYPE_NEVER_USED 0x00
++
++#define ENTRY_TYPE_TEXPAD 0x21
++
++/* Critical primary entries */
++#define ENTRY_TYPE_BITMAP 0x81
++#define ENTRY_TYPE_UPCASE 0x82
++#define ENTRY_TYPE_LABEL 0x83
++#define ENTRY_TYPE_KEY 0x84
++#define ENTRY_TYPE_NORMAL 0x85
++#define ENTRY_TYPE_UNK_CRIT 0x86
++#define ENTRY_TYPE_MAX_CRIT 0x9f
++
++/* Benign primary entries */
++#define ENTRY_TYPE_GUID 0xA0
++#define ENTRY_TYPE_DUMMY 0xA1
++#define ENTRY_TYPE_WINCE 0xA2
++
++/* Critical secondary entries */
++#define ENTRY_TYPE_STREAM 0xC0
++#define ENTRY_TYPE_NAME 0xC1
++#define ENTRY_TYPE_WINMOB 0xC2
++#define ENTRY_TYPE_MAX_CRIT2 0xDF
++
++#define ENTRY_FLAG_ALLOCATION 1
++#define ENTRY_FLAG_CONTINUES 2
++#define ENTRY_FLAG_SECBITMAP 1
++
++/* Possible values for exfat_direntry.norm.Attributes */
++#define ENTRY_ATTR_RO 0x0001
++#define ENTRY_ATTR_HIDDEN 0x0002
++#define ENTRY_ATTR_SYS 0x0004
++#define ENTRY_ATTR_RESERVED 0x0008
++#define ENTRY_ATTR_DIR 0x0010
++#define ENTRY_ATTR_ARCH 0x0020
++
++/* exFAT boot sector (512 bytes) */
++struct exfat_boot {
++ u8 jump_code[3]; /* 0x00: Jump to boot code */
++ u8 oemid[8]; /* 0x03: "EXFAT " */
++ u8 zero[0x35]; /* 0x0B: Must be zero */
++ __le64 partition_offset; /* 0x40: In sectors */
++ __le64 sectors_per_volume; /* 0x48: */
++ __le32 fat_lsn; /* 0x50: First FAT sector */
++ __le32 fat_len; /* 0x54: Length in sectors of FAT */
++ __le32 cluster_heap_lsn; /* 0x58: Cluster heap offset*/
++ __le32 clusters; /* 0x5c: Number of clusters in heap */
++ __le32 root_lcn; /* 0x60: First cluster of the root */
++ __le32 serial_num; /* 0x64 */
++ u8 minor; /* 0x68: */
++ u8 major; /* 0x69: */
++ u8 ex_flags_lo; /* 0x6A: BOOT_FLAG_SECFAT... */
++ u8 ex_flags_hi; /* 0x6B: always 0 */
++ u8 sector_bits; /* 0x6C: 9-12 */
++ u8 sct_per_clst_bits; /* 0x6D: 0-25 */
++ u8 fats; /* 0x6E: 1-2 */
++ u8 drive_select; /* 0x6F: 0x80 */
++ u8 percent_in_use; /* 0x70: */
++ u8 res[7]; /* 0x71: */
++ u8 code[0x186]; /* 0x78 */
++ u8 signature[2]; /* 0x1FE: Boot signature =0xAA55 */
++};
++
++static_assert(sizeof(struct exfat_boot) == 0x200);
++
++union exfat_zone {
++ u8 all;
++
++ struct {
++ signed char bias : 7; /* signed value in 15 minutes.*/
++ signed char valid : 1;
++ } zone;
++};
++
++static_assert(sizeof(union exfat_zone) == 1);
++
++/* exFAT directory entry (32 bytes) */
++union exfat_direntry {
++ u8 type; /* 0x00: valid if > 0x80 */
++
++ struct {
++ u8 type; /* 0x00: 85 == ENTRY_TYPE_NORMAL */
++ u8 subentries; /* 0x01: number of secondary entries */
++ __le16 checksum; /* 0x02:Checksum of primary+secondary entries*/
++ __le16 attributes; /* 0x04: */
++ u8 res[2]; /* 0x06: */
++ __le32 cr_time; /* 0x08: Create time */
++ __le32 mod_time; /* 0x0C: Modification time */
++ __le32 acc_time; /* 0x10: Last access time */
++ /* 0-200, milliseconds over the time (in 10's of ms) */
++ u8 inc_cr_time; /* 0x14: */
++ u8 inc_mod_time; /* 0x15: */
++ s8 cr_time_zone; /* 0x16: time zone */
++ s8 mod_time_zone; /* 0x17: time zone */
++ s8 acc_time_zone; /* 0x18: time zone */
++ u8 res2[7]; /* 0x19 */
++ } norm;
++
++ struct {
++ u8 type; /* 0x00: C0 == ENTRY_TYPE_STREAM */
++ u8 flags; /* 0x01: ENTRY_FLAG_ALLOCATION/ENTRY_FLAG_CONTINUES*/
++ u8 res; /* 0x02: */
++ u8 namelen; /* 0x03: Number of unicode symbols */
++ __le16 namehash; /* 0x04: Hash of up-cased name */
++ __le16 res2; /* 0x06: */
++ __le64 valid; /* 0x08: Valid data length */
++ __le32 res3; /* 0x10: */
++ __le32 start_lcn; /* 0x14: */
++ __le64 size; /* 0x18: */
++ } stream;
++
++ struct {
++ u8 type; /* 0x00: C1 == ENTRY_TYPE_NAME */
++ u8 flags; /* 0x01: */
++ __le16 name[0xf]; /* 0x02: Unicode name */
++ } name;
++
++ struct {
++ u8 type; /* 0x00: 81 == ENTRY_TYPE_BITMAP */
++ u8 flags; /* 0x01: ENTRY_FLAG_SECBITMAP */
++ u8 res[18]; /* 0x02: */
++ __le32 start_lcn; /* 0x14: */
++ __le64 size; /* 0x18: */
++ } bitmap;
++
++ struct {
++ u8 type; /* 0x00: 82 == ENTRY_TYPE_UPCASE */
++ u8 res[3]; /* 0x01: */
++ __le32 checksum; /* 0x04: 4-byte checksum of the up-case table*/
++ u8 res2[12]; /* 0x08: */
++ __le32 start_lcn; /* 0x14: */
++ __le64 size; /* 0x18: */
++ } upcase;
++
++ struct {
++ u8 type; /* 0x00: 83 == ENTRY_TYPE_LABEL */
++ u8 length; /* 0x01: number of characters <= 15 */
++ __le16 label[0xf]; /* 0x02: Unicode label */
++ } label;
++};
++
++static_assert(sizeof(union exfat_direntry) == 0x20);
++#define EXFAT_LOG2_ENTRY 5
++
++static inline bool de_is_directory(const union exfat_direntry *de)
++{
++ return FlagOn(de->norm.attributes, cpu_to_le32(ENTRY_ATTR_DIR));
++}
++
++static inline bool de_is_known_critical(const union exfat_direntry *de)
++{
++ return (de->type &
++ (ENTRY_TYPE_SECONDARY_MASK | ENTRY_TYPE_BENING_MASK)) ||
++ de->type <= ENTRY_TYPE_NORMAL;
++}
++
++#define EXFAT_DEFAULT_ERASE_BLOCK_SIZE (64 * 1024)
++
++/* The size in bytes of the all the directory entries in a given directory */
++/* should not exceed 256 megabytes */
++#define MAX_BYTES_PER_DIRECTORY (256 * 1024 * 1024)
++#define MAX_EXFAT_FILENAME 255
++
++/* 255 unicode symbols require 17 slots ENTRY_TYPE_NAME plus*/
++/* one ENTRY_TYPE_STREAM*/
++#define MAX_SUBENTRIES_PER_NAME \
++ (1 + (MAX_EXFAT_FILENAME + \
++ ARRAY_SIZE(((union exfat_direntry *)NULL)->name.name) - 1) / \
++ ARRAY_SIZE(((union exfat_direntry *)NULL)->name.name))
++static_assert(MAX_SUBENTRIES_PER_NAME == 18);
++
++#define EXFAT_CLUSTER_FREE 0x00000000u
++#define EXFAT_CLUSTER_MIN 0x00000002u
++#define EXFAT_CLUSTER_MAX 0xFFFFFFF6u /* Maximum number of fat entries */
++#define EXFAT_CLUSTER_BAD 0xFFFFFFF7u
++#define EXFAT_CLUSTER_EOF 0xFFFFFFFFu
++
++#define EXFAT_CLUSTER_FIRST 2
++
++static inline u32 exfat_check_sum_32(u32 sum, u8 val)
++{
++ return (u32)(((sum << (8 * sizeof(u32) - 1)) | (sum >> 1)) + val);
++}
++
++static inline u16 exfat_check_sum_16(u16 sum, u8 val)
++{
++ return (u16)(((sum << (8 * sizeof(u16) - 1)) | (sum >> 1)) + val);
++}
++
++/* special variant for normal entries, exclude field 'checksum'*/
++static inline u16 exfat_checksum_norm_entry(const union exfat_direntry *e)
++{
++ const u8 *p = (u8 *)e;
++ const u8 *end = (u8 *)(e + 1);
++ u16 checksum = exfat_check_sum_16(exfat_check_sum_16(0, p[0]), p[1]);
++
++ p += 4; /* Skip 'checksum' */
++
++ do
++ checksum = exfat_check_sum_16(checksum, *p++);
++ while (p < end);
++
++ return checksum;
++}
++
++static inline u16 exfat_checksum_entry(const union exfat_direntry *e,
++ u16 checksum)
++{
++ const u8 *p = (u8 *)e;
++ const u8 *end = (u8 *)(e + 1);
++
++ do
++ checksum = exfat_check_sum_16(checksum, *p++);
++ while (p < end);
++
++ return checksum;
++}
+diff --git a/fs/exfat/exfat_fs.h b/fs/exfat/exfat_fs.h
+new file mode 100644
+index 000000000000..5f8713fe1b0c
+--- /dev/null
++++ b/fs/exfat/exfat_fs.h
+@@ -0,0 +1,388 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * linux/fs/exfat/super.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/buffer_head.h>
++#include <linux/hash.h>
++#include <linux/nls.h>
++#include <linux/ratelimit.h>
++
++struct exfat_mount_options {
++ kuid_t fs_uid;
++ kgid_t fs_gid;
++ u16 fs_fmask;
++ u16 fs_dmask;
++ u16 codepage; /* Codepage for shortname conversions */
++ /* minutes bias= UTC - local time. Eastern time zone: +300, */
++ /*Paris,Berlin: -60, Moscow: -180*/
++ int bias;
++ u16 allow_utime; /* permission for setting the [am]time */
++ unsigned quiet : 1, /* set = fake successful chmods and chowns */
++ showexec : 1, /* set = only set x bit for com/exe/bat */
++ sys_immutable : 1, /* set = system files are immutable */
++ utf8 : 1, /* Use of UTF-8 character set (Default) */
++ /* create escape sequences for unhandled Unicode */
++ unicode_xlate : 1, flush : 1, /* write things quickly */
++ tz_set : 1, /* Filesystem timestamps' offset set */
++ discard : 1 /* Issue discard requests on deletions */
++ ;
++};
++
++#define EXFAT_ROOT_INO 2
++#define EXFAT_FAT_INO (EXFAT_ROOT_INO + 1)
++#define EXFAT_BITMAP_INO (EXFAT_ROOT_INO + 2)
++#define EXFAT_MAX_RESERVED_INO (EXFAT_ROOT_INO + 3)
++
++#define EXFAT_HASH_BITS 8
++#define EXFAT_HASH_SIZE (1UL << EXFAT_HASH_BITS)
++
++//
++// Possible values for exfat_sb_info::Flags
++//
++#define EXFAT_FLAGS_BOOT1_VALID 0x00000010
++#define EXFAT_FLAGS_BOOT2_VALID 0x00000020
++
++/*
++ * EXFAT file system in-core superblock data
++ */
++
++struct exfat_sb_info {
++ struct super_block *sb;
++
++ u64 blocks_per_volume;
++
++ u32 cluster_size; // bytes per cluster
++ u32 cluster_mask; // == cluster_size - 1
++ u32 blocksize_mask; // sb->s_blocksize - 1
++ u32 blocks_per_cluster; // cluster_size / sb->s_blocksize
++ u8 cluster_bits; // == cluster_size == 1 << cluster_bits
++ u32 clusters; /* Number of clusters in heap */
++ u32 serial_num;
++ u8 ex_flags;
++
++ u32 flags; /* EXFAT_FLAGS_XXX */
++
++ u64 fat0_pbo;
++ u64 bytes_per_fat;
++ u64 cluster_heap;
++ u32 label_off;
++ u16 *upcase_tbl; /* Uncompressed upcase table */
++ u32 free_clusters;
++ u32 next_cluster_to_allocate_from; /* 0 based */
++ u32 first_free_cluster; /* 0 based */
++
++ struct mutex exfat_lock;
++ struct mutex s_lock;
++ struct exfat_mount_options options;
++ struct nls_table *nls; /* Codepage used on disk */
++ struct inode *fat_inode;
++ struct inode *bitmap_inode;
++
++ struct ratelimit_state ratelimit;
++
++ spinlock_t inode_hash_lock;
++ struct hlist_head inode_hashtable[EXFAT_HASH_SIZE];
++
++ u32 dirty; /* fs state before mount */
++ struct rcu_head rcu;
++};
++
++/* Translates logical cluster number to physical byte offset */
++static inline u64 exfat_lcn_to_pbo(const struct exfat_sb_info *sbi, u32 lcn)
++{
++ return sbi->cluster_heap + ((u64)lcn << sbi->cluster_bits);
++}
++
++/* Align up on cluster boundary */
++static inline u64 exfat_align_up(const struct exfat_sb_info *sbi, u64 size)
++{
++ return (size + sbi->cluster_mask) & ~((loff_t)sbi->cluster_mask);
++}
++
++static inline u32 exfat_bytes_to_cluster(const struct exfat_sb_info *sbi,
++ u64 size)
++{
++ return (size + sbi->cluster_mask) >> sbi->cluster_bits;
++}
++
++struct exfat_run {
++ u32 vcn; /* virtual cluster number */
++ u32 len; /* length of extent in clusters */
++ u32 lcn; /* logical cluster number */
++};
++
++struct exfat_runs_tree {
++ struct rb_root root;
++ struct exfat_run_rb *cache_er; /* recently accessed extent */
++};
++
++struct dir_shared {
++ u32 unused_pos; /* first unused entry */
++};
++
++struct file_shared {
++};
++
++typedef u64 exfat_pos[3];
++
++/*
++ * EXFAT file system inode data in memory
++ */
++struct exfat_inode_info {
++ /* physical byte offset of directory entries normal + stream + names*/
++ exfat_pos i_pos;
++ loff_t i_valid; /* valid size */
++
++ u32 i_lcn0; /* first cluster or 0 */
++ u8 i_attrs; /* unused attribute bits */
++ u8 i_stream_flags; /* ENTRY_FLAG_ALLOCATION/ENTRY_FLAG_CONTINUES */
++
++ union {
++ struct dir_shared dir;
++ struct file_shared file;
++ } shared;
++
++ struct hlist_node i_exfat_hash; /* hash by i_pos */
++ struct rw_semaphore truncate_lock; /* protect bmap against truncate */
++ struct timespec64 i_crtime;
++ rwlock_t i_run_lock;
++ struct exfat_runs_tree i_runs_tree; /* i_run_lock protected */
++
++ struct inode vfs_inode;
++};
++
++struct exfat_slot_info {
++ /* physical byte offset of directory entries normal + stream + names*/
++ exfat_pos pos;
++ union exfat_direntry *de_norm;
++ struct buffer_head *bh[3];
++ u32 nbh; /* filled bh*/
++ u32 vbo;
++ /* maximum number of slots == 19 (0x260 bytes). 3 clusters */
++ /*(512 bytes each) per normal+stream+names always store full info*/
++ u32 nr_slots; /* number of slots */
++ u32 slots_norm; /* number of slots in de_norm */
++};
++
++static inline struct exfat_sb_info *exfat_sb(struct super_block *sb)
++{
++ return sb->s_fs_info;
++}
++
++static inline struct exfat_inode_info *exfat_i(struct inode *inode)
++{
++ return container_of(inode, struct exfat_inode_info, vfs_inode);
++}
++
++/*
++ * If ->i_mode can't hold S_IWUGO (i.e. ENTRY_ATTR_RO), we use ->i_attrs to
++ * save ENTRY_ATTR_RO instead of ->i_mode.
++ *
++ * If it's directory and !sbi->options.rodir, ENTRY_ATTR_RO isn't read-only
++ * bit, it's just used as flag for app.
++ */
++static inline int exfat_mode_can_hold_ro(struct inode *inode)
++{
++ struct exfat_sb_info *sbi = inode->i_sb->s_fs_info;
++ umode_t mask;
++
++ if (S_ISDIR(inode->i_mode))
++ return 0;
++
++ mask = ~sbi->options.fs_fmask;
++ if (!(mask & 0222))
++ return 0;
++ return 1;
++}
++
++/* Convert attribute bits and a mask to the UNIX mode. */
++static inline umode_t exfat_make_mode(struct exfat_sb_info *sbi, u8 attrs,
++ umode_t mode)
++{
++ mode &= ~0222;
++
++ if (attrs & ENTRY_ATTR_DIR)
++ return (mode & ~sbi->options.fs_dmask) | S_IFDIR;
++ else
++ return (mode & ~sbi->options.fs_fmask) | S_IFREG;
++}
++
++/* Return the FAT attribute byte for this inode */
++static inline u8 exfat_make_attrs(struct inode *inode)
++{
++ u8 attrs = exfat_i(inode)->i_attrs;
++
++ if (S_ISDIR(inode->i_mode))
++ attrs |= ENTRY_ATTR_DIR;
++ if (exfat_mode_can_hold_ro(inode) && !(inode->i_mode & 0222))
++ attrs |= ENTRY_ATTR_RO;
++ return attrs;
++}
++
++static inline void exfat_save_attrs(struct inode *inode, u8 attrs)
++{
++ struct exfat_inode_info *ei = exfat_i(inode);
++
++ if (exfat_mode_can_hold_ro(inode))
++ ei->i_attrs = attrs; // & ATTR_UNUSED;
++ else
++ ei->i_attrs = attrs & (ENTRY_ATTR_RO); // | ATTR_UNUSED
++}
++
++static inline bool exfat_valid_lcn(const struct exfat_sb_info *sbi, u32 lcn)
++{
++ return lcn >= EXFAT_CLUSTER_FIRST &&
++ lcn < sbi->clusters + EXFAT_CLUSTER_FIRST;
++}
++
++static inline void lock_exfat(struct exfat_sb_info *sbi)
++{
++ mutex_lock(&sbi->exfat_lock);
++}
++
++static inline void unlock_exfat(struct exfat_sb_info *sbi)
++{
++ mutex_unlock(&sbi->exfat_lock);
++}
++
++static inline struct buffer_head *exfat_bread(struct super_block *sb,
++ sector_t block)
++{
++ struct buffer_head *bh;
++
++ WARN_ON(block >= exfat_sb(sb)->blocks_per_volume);
++
++ bh = sb_bread(sb, block);
++ if (bh)
++ return bh;
++ __exfat_trace(sb, KERN_ERR, "failed to read volume at offset 0x%llx",
++ (u64)block << sb->s_blocksize_bits);
++ return NULL;
++}
++
++/* globals from dir.c */
++u16 exfat_name_hash(const u16 *Name, u32 Len, const u16 *upcase_tbl);
++u32 exfat_subdirs(struct inode *dir);
++bool exfat_dir_empty(struct inode *dir);
++int exfat_scan_root(struct super_block *sb);
++int exfat_remove_entries(struct inode *dir,
++ const struct exfat_slot_info *sinfo);
++int exfat_add_entries(struct inode *dir, const union exfat_direntry *slots,
++ u32 nr_slots, struct exfat_slot_info *sinfo);
++
++u16 exfat_name_hash(const __le16 *name, u32 len, const u16 *upcase_tbl);
++extern const struct file_operations exfat_dir_operations;
++
++/* globals from inode.c */
++int exfat_add_clusters(struct inode *inode, u32 len_to_alloc,
++ struct exfat_run *run, u32 nr_runs);
++int exfat_free_clusters(struct inode *inode, u32 len, bool do_trim);
++int exfat_block_truncate_page(struct inode *inode, loff_t from);
++void exfat_attach(struct inode *inode, const exfat_pos i_pos);
++void exfat_detach(struct inode *inode);
++struct inode *exfat_iget(struct super_block *sb, const u64 pos);
++extern const struct address_space_operations exfat_aops;
++struct inode *exfat_build_inode(struct super_block *sb,
++ const struct exfat_slot_info *sinfo);
++void exfat_evict_inode(struct inode *inode);
++int exfat_write_inode(struct inode *inode, struct writeback_control *wbc);
++int exfat_sync_inode(struct inode *inode);
++int exfat_flush_inodes(struct super_block *sb, struct inode *i1,
++ struct inode *i2);
++
++/* globals from cache.c*/
++int __init exfat_run_cache_init(void);
++void exfat_run_cache_exit(void);
++int exfat_insert_run(struct inode *inode, u32 vcn, u32 lcn, u32 len);
++int exfat_truncate_run(struct inode *inode, u32 vcn, bool do_trim);
++int exfat_remove_run(struct inode *inode, u32 vcn);
++/* translates virtual cluster into logical cluster*/
++int exfat_vcn_to_lcn(struct inode *inode, u32 vcn, u32 *len, u32 *lcn);
++/* translates virtual byte offset into physical byte offset */
++int exfat_vbo_to_pbo(struct inode *inode, u64 vbo, u64 *pbo, u64 *bytes);
++int exfat_load_runs(struct inode *inode, u32 *len);
++bool is_run_one_fragment(struct inode *inode);
++
++/* globals from fatent.c */
++struct exfat_entry {
++ struct page *page;
++};
++
++static inline void exfat_entry_init(struct exfat_entry *fatent)
++{
++ fatent->page = NULL;
++}
++
++static inline void exfat_entry_end(struct exfat_entry *fatent)
++{
++ struct page *page = fatent->page;
++
++ if (!page)
++ return;
++ flush_dcache_page(page);
++ kunmap(page);
++ put_page(page);
++ fatent->page = NULL;
++}
++
++int exfat_fat_get(struct super_block *sb, struct exfat_entry *exfat_entry,
++ u32 lcn, u32 *next);
++int exfat_fat_set(struct super_block *sb, struct exfat_entry *exfat_entry,
++ u32 lcn, u32 next, int wait);
++int exfat_chain_add(struct inode *inode, u32 vcn, u32 lcn, u32 len);
++
++/* globals from file.c*/
++int exfat_file_fsync(struct file *filp, loff_t start, loff_t end, int datasync);
++int exfat_truncate_vcn(struct inode *inode, u32 vcn);
++void exfat_truncate_blocks(struct inode *inode, loff_t offset);
++int exfat_getattr(const struct path *path, struct kstat *stat, u32 request_mask,
++ u32 flags);
++int exfat_setattr(struct dentry *dentry, struct iattr *attr);
++extern const struct inode_operations exfat_file_inode_operations;
++extern const struct file_operations exfat_file_operations;
++
++/* globals from name_i.c*/
++/* Convert input string to little endian unicode */
++int xlate_to_uni(const u8 *name, u32 name_len, __le16 *unicode, bool escape,
++ bool utf8, struct nls_table *nls);
++int exfat_search(struct inode *inode, const struct qstr *name,
++ struct exfat_slot_info *sinfo);
++extern const struct inode_operations exfat_dir_inode_operations;
++
++/* globals from super.c */
++int exfat_page_cache_readahead(struct address_space *mapping, pgoff_t offset,
++ unsigned long nr_to_read);
++int exfat_tz_bias(struct exfat_sb_info *sbi);
++void exfat_time_2unix(struct timespec64 *ts, __le32 tm, u8 inc, s8 zone,
++ int bias_minutes);
++int exfat_tz_bias(struct exfat_sb_info *sbi);
++int exfat_update_time(struct inode *inode, struct timespec64 *now, int flags);
++int exfat_sync_bhs(struct buffer_head **bhs, u32 nr_bhs);
++void exfat_time_2unix(struct timespec64 *ts, __le32 tm, u8 inc, s8 zone,
++ int bias_minutes);
++u32 exfat_time_to_disk(u8 *inc, const struct timespec64 *ts);
++void exfat_set_state(struct super_block *sb, u32 set, bool force);
++void exfat_truncate_time(struct inode *inode, struct timespec64 *now,
++ u32 flags);
++
++/* globals from bitmap.c */
++int exfat_count_free_clusters(struct super_block *sb);
++int exfat_trim_fs(struct inode *inode, struct fstrim_range *range);
++/*lcn - 2 based*/
++int exfat_bitmap_alloc_clusters(struct super_block *sb, u32 lcn_from,
++ u32 len_to_alloc, u32 *allocated_lcn,
++ u32 *allocated_len, bool exactly);
++/*lcn - 2 based*/
++int exfat_bitmap_free_clusters(struct super_block *sb, u32 lcn, u32 len,
++ bool do_trim);
++
++/* globals from upcase.c */
++int exfat_load_upcase(struct super_block *sb, const union exfat_direntry *de,
++ bool usedefault_if_error);
++
++/* This variable is used to get the bias */
++extern struct timezone sys_tz;
+diff --git a/fs/exfat/fatent.c b/fs/exfat/fatent.c
+new file mode 100644
+index 000000000000..df0a7b77efe9
+--- /dev/null
++++ b/fs/exfat/fatent.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/fatent.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/fs.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++static __le32 *exfat_fat_init(struct super_block *sb,
++ struct exfat_entry *exfat_entry, u32 lcn)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ u32 index;
++ struct page *page;
++ u32 vbo;
++
++ if (!exfat_valid_lcn(sbi, lcn)) {
++ exfat_entry_end(exfat_entry);
++ exfat_fs_error(sb, "invalid access to fat table, lcn 0x%x\n)",
++ lcn);
++ return ERR_PTR(-ENOENT);
++ }
++
++ vbo = lcn * sizeof(u32);
++ index = vbo >> PAGE_SHIFT;
++ page = exfat_entry->page;
++
++ if (page && page->index != index) {
++ flush_dcache_page(page);
++ kunmap(page);
++ put_page(page);
++ page = NULL;
++ }
++
++ if (!page) {
++ page = read_mapping_page(sbi->fat_inode->i_mapping, index,
++ NULL);
++
++ if (!IS_ERR(page)) {
++ kmap(page);
++ if (PageError(page)) {
++ kunmap(page);
++ put_page(page);
++ page = ERR_PTR(-EIO);
++ }
++ }
++
++ if (IS_ERR(page)) {
++ __exfat_trace(sb, KERN_ERR,
++ "failed to read fat at 0x%x)", index);
++
++ return (__le32 *)page;
++ }
++
++ exfat_entry->page = page;
++ }
++
++ return (__le32 *)Add2Ptr(page_address(page), vbo & (PAGE_SIZE - 1));
++}
++
++int exfat_fat_get(struct super_block *sb, struct exfat_entry *exfat_entry,
++ u32 lcn, u32 *next)
++{
++ __le32 *ptr = exfat_fat_init(sb, exfat_entry, lcn);
++
++ if (IS_ERR(ptr))
++ return PTR_ERR(ptr);
++
++ *next = le32_to_cpu(*ptr);
++ if (*next >= EXFAT_CLUSTER_BAD)
++ *next = EXFAT_CLUSTER_EOF;
++ return 0;
++}
+diff --git a/fs/exfat/file.c b/fs/exfat/file.c
+new file mode 100644
+index 000000000000..d18ff563627f
+--- /dev/null
++++ b/fs/exfat/file.c
+@@ -0,0 +1,93 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/file.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ * regular file handling primitives for exfat-based filesystems
++ */
++
++#include <linux/backing-dev.h>
++#include <linux/compat.h>
++#include <linux/msdos_fs.h> /* FAT_IOCTL_XXX */
++#include <linux/falloc.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++static int exfat_ioctl_get_attributes(struct inode *inode,
++ u32 __user *user_attr)
++{
++ u32 attr;
++
++ inode_lock(inode);
++ attr = exfat_make_attrs(inode);
++ inode_unlock(inode);
++
++ return put_user(attr, user_attr);
++}
++
++static int exfat_ioctl_get_volume_id(struct inode *inode, u32 __user *user_attr)
++{
++ struct exfat_sb_info *sbi = inode->i_sb->s_fs_info;
++
++ return put_user(sbi->serial_num, user_attr);
++}
++
++long exfat_generic_ioctl(struct file *filp, u32 cmd, unsigned long arg)
++{
++ struct inode *inode = file_inode(filp);
++ u32 __user *user_attr = (u32 __user *)arg;
++
++ switch (cmd) {
++ case FAT_IOCTL_GET_ATTRIBUTES:
++ return exfat_ioctl_get_attributes(inode, user_attr);
++ case FAT_IOCTL_GET_VOLUME_ID:
++ return exfat_ioctl_get_volume_id(inode, user_attr);
++ }
++ return -ENOTTY; /* Inappropriate ioctl for device */
++}
++
++#ifdef CONFIG_COMPAT
++static long exfat_generic_compat_ioctl(struct file *filp, u32 cmd,
++ unsigned long arg)
++
++{
++ return exfat_generic_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
++}
++#endif
++
++// inode_operations::getattr
++int exfat_getattr(const struct path *path, struct kstat *stat, u32 request_mask,
++ u32 flags)
++{
++ struct inode *inode = d_inode(path->dentry);
++ struct super_block *sb = inode->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(inode);
++
++ generic_fillattr(inode, stat);
++
++ stat->result_mask |= STATX_BTIME;
++ stat->btime.tv_sec = ei->i_crtime.tv_sec;
++ stat->btime.tv_nsec = ei->i_crtime.tv_nsec;
++ stat->blksize = sbi->cluster_size;
++
++ return 0;
++}
++
++const struct inode_operations exfat_file_inode_operations = {
++ .getattr = exfat_getattr,
++};
++
++const struct file_operations exfat_file_operations = {
++ .llseek = generic_file_llseek,
++ .read_iter = generic_file_read_iter,
++ .mmap = generic_file_mmap,
++ .unlocked_ioctl = exfat_generic_ioctl,
++#ifdef CONFIG_COMPAT
++ .compat_ioctl = exfat_generic_compat_ioctl,
++#endif
++ .splice_read = generic_file_splice_read,
++};
+diff --git a/fs/exfat/inode.c b/fs/exfat/inode.c
+new file mode 100644
+index 000000000000..949d3a1f35b4
+--- /dev/null
++++ b/fs/exfat/inode.c
+@@ -0,0 +1,317 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/inode.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/fs.h>
++#include <linux/iversion.h>
++#include <linux/mpage.h>
++#include <linux/uio.h>
++#include <linux/writeback.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++/*
++ * New exfat inode stuff. We do the following:
++ * a) i_ino is constant and has nothing with on-disk location.
++ * b) exfat manages its own cache of directory entries.
++ * c) *This* cache is indexed by on-disk location.
++ * d) inode has an associated directory entry, all right, but
++ * it may be unhashed.
++ * e) currently entries are stored within struct inode. That should
++ * change.
++ * f) we deal with races in the following way:
++ * 1. readdir() and lookup() do exfat-dir-cache lookup.
++ * 2. rename() unhashes the F-d-c entry and rehashes it in
++ * a new place.
++ * 3. unlink() and rmdir() unhash F-d-c entry.
++ * 4. exfat_write_inode() checks whether the thing is unhashed.
++ * If it is we silently return. If it isn't we do bread(),
++ * check if the location is still valid and retry if it
++ * isn't. Otherwise we do changes.
++ * 5. Spinlock is used to protect hash/unhash/location check/lookup
++ * 6. exfat_evict_inode() unhashes the F-d-c entry.
++ * 7. lookup() and readdir() do igrab() if they find a F-d-c entry
++ * and consider negative result as cache miss.
++ */
++
++static inline unsigned long exfat_hash(const u64 pos)
++{
++#ifdef hash_64
++ return hash_64(pos >> EXFAT_LOG2_ENTRY, EXFAT_HASH_BITS);
++#else
++ return hash_32(pos >> EXFAT_LOG2_ENTRY, EXFAT_HASH_BITS);
++#endif
++}
++
++void exfat_attach(struct inode *inode, const exfat_pos i_pos)
++{
++ struct super_block *sb = inode->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(inode);
++
++ if (inode->i_ino != EXFAT_ROOT_INO) {
++ struct hlist_head *head =
++ sbi->inode_hashtable + exfat_hash(i_pos[0]);
++ spin_lock(&sbi->inode_hash_lock);
++ memcpy(ei->i_pos, i_pos, sizeof(exfat_pos));
++ hlist_add_head(&ei->i_exfat_hash, head);
++ spin_unlock(&sbi->inode_hash_lock);
++ }
++}
++
++void exfat_detach(struct inode *inode)
++{
++ struct super_block *sb = inode->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(inode);
++
++ spin_lock(&sbi->inode_hash_lock);
++ memset(&ei->i_pos, 0, sizeof(ei->i_pos));
++ hlist_del_init(&ei->i_exfat_hash);
++ spin_unlock(&sbi->inode_hash_lock);
++}
++
++struct inode *exfat_iget(struct super_block *sb, const u64 pos)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct hlist_head *head = sbi->inode_hashtable + exfat_hash(pos);
++ struct exfat_inode_info *ei;
++ struct inode *inode = NULL;
++
++ spin_lock(&sbi->inode_hash_lock);
++ hlist_for_each_entry(ei, head, i_exfat_hash) {
++ WARN_ON(ei->vfs_inode.i_sb != sb);
++ if (ei->i_pos[0] != pos)
++ continue;
++ inode = igrab(&ei->vfs_inode);
++ if (inode)
++ break;
++ }
++ spin_unlock(&sbi->inode_hash_lock);
++
++ return inode;
++}
++
++static int exfat_get_block_vbo(struct inode *inode, u64 vbo,
++ struct buffer_head *bh, int create)
++{
++ const struct super_block *sb = inode->i_sb;
++ const struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(inode);
++ u64 bytes, pbo;
++ int err;
++
++ if (create)
++ return -EROFS;
++
++ if (inode->i_ino == EXFAT_FAT_INO) {
++ if (vbo >= sbi->bytes_per_fat)
++ return -EINVAL;
++ set_buffer_mapped(bh);
++ bh->b_bdev = sb->s_bdev;
++ bh->b_blocknr = (sbi->fat0_pbo + vbo) >> sb->s_blocksize_bits;
++ return 0;
++ }
++
++ if (vbo >= ei->i_valid)
++ return 0;
++
++ err = exfat_vbo_to_pbo(inode, vbo, &pbo, &bytes);
++ if (err)
++ return err;
++
++ WARN_ON(ei->i_valid & (sb->s_blocksize - 1));
++
++ if (vbo + bytes > ei->i_valid)
++ bytes = ei->i_valid - vbo;
++
++ set_buffer_mapped(bh);
++ bh->b_bdev = sb->s_bdev;
++ bh->b_blocknr = pbo >> sb->s_blocksize_bits;
++ if (bh->b_size > bytes)
++ bh->b_size = bytes;
++
++ return 0;
++}
++
++static int exfat_get_block(struct inode *inode, sector_t vbn,
++ struct buffer_head *bh_result, int create)
++{
++ return exfat_get_block_vbo(inode, (u64)vbn << inode->i_blkbits,
++ bh_result, create);
++}
++
++static int exfat_get_block_bmap(struct inode *inode, sector_t vsn,
++ struct buffer_head *bh_result, int create)
++{
++ return exfat_get_block_vbo(inode, (u64)vsn << 9, bh_result, create);
++}
++
++static sector_t exfat_bmap(struct address_space *mapping, sector_t block)
++{
++ sector_t blocknr;
++ struct inode *inode = mapping->host;
++ struct exfat_inode_info *ei = exfat_i(inode);
++
++ down_read(&ei->truncate_lock);
++ blocknr = generic_block_bmap(mapping, block, exfat_get_block_bmap);
++ up_read(&ei->truncate_lock);
++
++ return blocknr;
++}
++
++static int exfat_readpage(struct file *file, struct page *page)
++{
++ return mpage_readpage(page, exfat_get_block);
++}
++
++static int exfat_readpages(struct file *file, struct address_space *mapping,
++ struct list_head *pages, unsigned int nr_pages)
++{
++ return mpage_readpages(mapping, pages, nr_pages, exfat_get_block);
++}
++
++static ssize_t exfat_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
++{
++ struct file *file = iocb->ki_filp;
++ struct address_space *mapping = file->f_mapping;
++ struct inode *inode = mapping->host;
++ ssize_t ret;
++
++ ret = blockdev_direct_IO(iocb, inode, iter, exfat_get_block);
++
++ return ret;
++}
++
++/* doesn't deal with root inode */
++static int exfat_fill_inode(struct inode *inode,
++ const struct exfat_slot_info *sinfo)
++{
++ struct super_block *sb = inode->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_inode_info *ei = exfat_i(inode);
++ int bias = exfat_tz_bias(sbi);
++ union exfat_direntry *de_norm = sinfo->de_norm;
++ u16 attr = le16_to_cpu(de_norm->norm.attributes);
++ u32 avail = sb->s_blocksize - PtrOffset(sinfo->bh[0], de_norm);
++ u64 valid;
++ union exfat_direntry *de_strm =
++ avail >= sizeof(union exfat_direntry) ?
++ (de_norm + 1) :
++ (union exfat_direntry *)sinfo->bh[1]->b_data;
++
++ memcpy(&ei->i_pos, &sinfo->pos, sizeof(ei->i_pos));
++ inode->i_uid = sbi->options.fs_uid;
++ inode->i_gid = sbi->options.fs_gid;
++ inode_inc_iversion(inode);
++ inode->i_generation = get_seconds();
++
++ ei->i_lcn0 = le32_to_cpu(de_strm->stream.start_lcn);
++ inode->i_size = le64_to_cpu(de_strm->stream.size);
++ inode->i_blocks = exfat_align_up(sbi, inode->i_size) >> 9;
++
++ ei->i_valid = le64_to_cpu(de_strm->stream.valid);
++ valid = (ei->i_valid + sb->s_blocksize - 1) & ~(sb->s_blocksize - 1);
++
++ if (ei->i_valid < inode->i_size && ei->i_valid != valid) {
++ /*workaround for not aligned valid size*/
++ exfat_warning(
++ sb,
++ "You will get a garbage in file %llx in range [%llx %llx)",
++ ei->i_pos[0], ei->i_valid, valid);
++ }
++ ei->i_valid = valid;
++
++ ei->i_stream_flags = de_strm->stream.flags;
++
++ WARN_ON(inode->i_nlink != 1);
++
++ if (FlagOn(attr, ENTRY_ATTR_DIR)) {
++ if (inode->i_size > MAX_BYTES_PER_DIRECTORY) {
++ exfat_fs_error(sb, "directory is to
+o large %llx",
++ inode->i_size);
++ return -EINVAL;
++ }
++ inode->i_generation &= ~1;
++ inode->i_mode = exfat_make_mode(sbi, attr, 0777);
++ inode->i_op = &exfat_dir_inode_operations;
++ inode->i_fop = &exfat_dir_operations;
++ set_nlink(inode, 2 + exfat_subdirs(inode));
++ } else {
++ inode->i_generation |= 1;
++ inode->i_mode = exfat_make_mode(sbi, attr, 0666);
++ inode->i_op = &exfat_file_inode_operations;
++ inode->i_fop = &exfat_file_operations;
++ inode->i_mapping->a_ops = &exfat_aops;
++ }
++
++ if (FlagOn(attr, ENTRY_ATTR_SYS) && sbi->options.sys_immutable)
++ inode->i_flags |= S_IMMUTABLE;
++
++ exfat_save_attrs(inode, attr);
++
++ exfat_time_2unix(&inode->i_mtime, le32_to_cpu(de_norm->norm.mod_time),
++ de_norm->norm.inc_mod_time,
++ de_norm->norm.mod_time_zone, bias);
++
++ inode->i_ctime = inode->i_mtime;
++
++ exfat_time_2unix(&inode->i_atime, le32_to_cpu(de_norm->norm.acc_time),
++ 0, de_norm->norm.acc_time_zone, bias);
++ WARN_ON(inode->i_atime.tv_nsec);
++
++ exfat_time_2unix(&ei->i_crtime, le32_to_cpu(de_norm->norm.cr_time),
++ de_norm->norm.inc_cr_time, de_norm->norm.cr_time_zone,
++ bias);
++ return 0;
++}
++
++struct inode *exfat_build_inode(struct super_block *sb,
++ const struct exfat_slot_info *sinfo)
++{
++ int err;
++ struct inode *inode = exfat_iget(sb, sinfo->pos[0]);
++
++ if (inode)
++ return inode;
++
++ inode = new_inode(sb);
++
++ if (!inode)
++ return ERR_PTR(-ENOMEM);
++
++ inode->i_ino = iunique(sb, EXFAT_MAX_RESERVED_INO);
++ inode_set_iversion(inode, 1);
++ err = exfat_fill_inode(inode, sinfo);
++ if (err) {
++ iput(inode);
++ return ERR_PTR(err);
++ }
++
++ exfat_attach(inode, sinfo->pos);
++ insert_inode_hash(inode);
++
++ return inode;
++}
++
++void exfat_evict_inode(struct inode *inode)
++{
++ truncate_inode_pages_final(&inode->i_data);
++ invalidate_inode_buffers(inode);
++ clear_inode(inode);
++ exfat_remove_run(inode, 0);
++ exfat_detach(inode);
++}
++
++const struct address_space_operations exfat_aops = { .readpage = exfat_readpage,
++ .readpages =
++ exfat_readpages,
++ .direct_IO =
++ exfat_direct_IO,
++ .bmap = exfat_bmap };
+diff --git a/fs/exfat/namei.c b/fs/exfat/namei.c
+new file mode 100644
+index 000000000000..6a6a5d26bdfc
+--- /dev/null
++++ b/fs/exfat/namei.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/namei.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/fs.h>
++#include <linux/namei.h>
++#include <linux/iversion.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++static inline unsigned long exfat_d_version(struct dentry *dentry)
++{
++ return (unsigned long)dentry->d_fsdata;
++}
++
++static inline void exfat_d_version_set(struct dentry *dentry,
++ unsigned long version)
++{
++ dentry->d_fsdata = (void *)version;
++}
++
++/* returns 0 if string can be used in exFAT names */
++static inline int is_bad_uni(const __le16 *s, size_t len, bool bext)
++{
++ while (len--) {
++ u16 uc = le16_to_cpu(*s++);
++
++ if (uc >= 0x80)
++ continue;
++
++ if (!uc)
++ return -1; // 0 means 'ok'
++
++ if (uc < 0x20)
++ return uc;
++
++ switch (uc) {
++ case 0x22: // '"'
++ case 0x2A: // '*'
++ case 0x2f: // '/'
++ case 0x3a: // ':'
++ case 0x3c: // '<'
++ case 0x3e: // '>'
++ case 0x3f: // '?'
++ case 0x5c: // '\\'
++ case 0x7c: // '|'
++ return uc;
++ }
++
++ if (bext) {
++ switch (uc) {
++ case 0x2b: // '+'
++ case 0x2c: // ','
++ case 0x2e: // '.'
++ case 0x3b: // ';'
++ case 0x3d: // '='
++ case 0x5b: // '['
++ case 0x5d: // ']'
++ return uc;
++ }
++ }
++ }
++
++ return 0;
++}
++
++/* Convert input string to little endian unicode */
++int xlate_to_uni(const u8 *name, u32 name_len, __le16 *unicode, bool escape,
++ bool utf8, struct nls_table *nls)
++{
++ int ret;
++ int clen;
++ const u8 *end;
++ u32 name_tail;
++
++ if (utf8) {
++ ret = utf8s_to_utf16s(name, name_len, UTF16_LITTLE_ENDIAN,
++ unicode, MAX_EXFAT_FILENAME + 2);
++ if (ret < 0) {
++ WARN_ON(1);
++ return ret;
++ } else if (ret > MAX_EXFAT_FILENAME) {
++ return -ENAMETOOLONG;
++ }
++ return ret;
++ }
++
++ end = name + name_len;
++ for (ret = 0; name < end; ret += 1, unicode += 1, name += clen) {
++ if (ret >= MAX_EXFAT_FILENAME)
++ return -ENAMETOOLONG;
++ name_tail = end - name;
++ if (escape && (*name == ':')) {
++ u8 uc[2];
++
++ if (name_tail < 5)
++ return -EINVAL;
++
++ if (hex2bin(uc, name + 1, 2) < 0)
++ return -EINVAL;
++ *unicode = uc[0] << 8 | uc[1];
++ clen = 5;
++ } else {
++ clen = nls->char2uni(name, name_tail, unicode);
++ if (clen < 0)
++ return -EINVAL;
++ }
++ }
++ return ret;
++}
++
++// inode_operations::lookup
++static struct dentry *exfat_lookup(struct inode *dir, struct dentry *dentry,
++ u32 flags)
++{
++ struct super_block *sb = dir->i_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct exfat_slot_info sinfo;
++ struct inode *inode;
++ struct dentry *alias;
++ int err;
++
++ mutex_lock(&sbi->s_lock);
++
++ err = exfat_search(dir, &dentry->d_name, &sinfo);
++
++ if (err) {
++ alias = -ENOENT == err ? d_splice_alias(NULL, dentry) :
++ ERR_PTR(err);
++ } else {
++ inode = exfat_build_inode(sb, &sinfo);
++ brelse(sinfo.bh[0]);
++ brelse(sinfo.bh[1]);
++ brelse(sinfo.bh[2]);
++
++ alias = IS_ERR(inode) ? (struct dentry *)inode :
++ d_splice_alias(inode, dentry);
++ }
++
++ mutex_unlock(&sbi->s_lock);
++
++ return alias;
++}
++
++const struct inode_operations exfat_dir_inode_operations = {
++ .lookup = exfat_lookup,
++ .getattr = exfat_getattr,
++};
+diff --git a/fs/exfat/super.c b/fs/exfat/super.c
+new file mode 100644
+index 000000000000..0705dab3c3fc
+--- /dev/null
++++ b/fs/exfat/super.c
+@@ -0,0 +1,1145 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/super.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ * TODO: prealloc, bitmap of used entries
++ *
++ */
++
++#include <linux/blkdev.h>
++#include <linux/fs.h>
++#include <linux/iversion.h>
++#include <linux/module.h>
++#include <linux/parser.h> // match_table_t
++#include <linux/seq_file.h>
++#include <linux/exportfs.h>
++#include <linux/statfs.h>
++#include <linux/backing-dev.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++/**
++ * exfat_trace() - print preformated exfat specific messages. Every thing what
++ * is not exfat_fs_error() should be __exfat_trace().
++ */
++void __exfat_trace(const struct super_block *sb, const char *level,
++ const char *fmt, ...)
++{
++ struct va_format vaf;
++ va_list args;
++
++ va_start(args, fmt);
++ vaf.fmt = fmt;
++ vaf.va = &args;
++ if (!sb)
++ printk("%sexfat: %pV", level, &vaf);
++ else
++ printk("%sexfat: %s: %pV", level, sb->s_id, &vaf);
++ va_end(args);
++}
++
++void __exfat_fs_error(struct super_block *sb, int report, const char *fmt, ...)
++{
++ va_list args;
++ struct va_format vaf;
++
++ if (report) {
++ va_start(args, fmt);
++ vaf.fmt = fmt;
++ vaf.va = &args;
++ __exfat_trace(sb, KERN_ERR, "error, %pV", &vaf);
++ va_end(args);
++ }
++ sb->s_flags |= SB_RDONLY;
++ __exfat_trace(sb, KERN_ERR, "Filesystem has been set read-only");
++}
++
++int exfat_tz_bias(struct exfat_sb_info *sbi)
++{
++ return sbi->options.tz_set ? -sbi->options.bias : sys_tz.tz_minuteswest;
++}
++
++/* Convert a exfat time/date pair to a UNIX date (seconds since 1 1 70). */
++void exfat_time_2unix(struct timespec64 *ts, __le32 tm, u8 inc, s8 zone,
++ int bias_minutes)
++{
++ ts->tv_sec =
++ mktime64(1980 + (tm >> 25), (tm >> 21) & 0xF, (tm >> 16) & 0x1F,
++ (tm >> 11) & 0x1F, (tm >> 5) & 0x3F, 2 * (tm & 0x1F));
++
++ if (zone >= 0)
++ ts->tv_sec += bias_minutes * 60; // local -> UTC
++ else if (zone & 0x7f) {
++ int zbias = (int)zone << 1;
++
++ zbias >>= 1;
++ ts->tv_sec -= zbias * (15 * 60);
++ } else {
++ WARN_ON((zone & 0x7f));
++ }
++
++ if (inc >= 100) {
++ ts->tv_sec += 1;
++ inc -= 100;
++ WARN_ON(inc >= 100);
++ if (inc >= 100)
++ inc = 0;
++ }
++
++ ts->tv_nsec = inc * 10000000;
++}
++
++static int read_pages(struct address_space *mapping, struct list_head *pages,
++ unsigned int nr_pages, gfp_t gfp)
++{
++ struct blk_plug plug;
++ unsigned int page_idx;
++ int ret;
++
++ blk_start_plug(&plug);
++
++ if (mapping->a_ops->readpages) {
++ ret = mapping->a_ops->readpages(NULL, mapping, pages, nr_pages);
++ /* Clean up the remaining pages */
++ put_pages_list(pages);
++ goto out;
++ }
++
++ for (page_idx = 0; page_idx < nr_pages; page_idx++) {
++ struct page *page = lru_to_page(pages);
++
++ list_del(&page->lru);
++ if (!add_to_page_cache_lru(page, mapping, page->index, gfp))
++ mapping->a_ops->readpage(NULL, page);
++ put_page(page);
++ }
++ ret = 0;
++
++out:
++ blk_finish_plug(&plug);
++
++ return ret;
++}
++/* mm/readahead.c */
++static unsigned int __exfat_page_cache_readahead(struct address_space *mapping,
++ pgoff_t offset,
++ unsigned long nr_to_read)
++{
++ struct inode *inode = mapping->host;
++ struct page *page;
++ unsigned long end_index; /* The last page we want to read */
++ LIST_HEAD(page_pool);
++ unsigned long page_idx;
++ unsigned int nr_pages = 0;
++ loff_t isize = i_size_read(inode);
++ gfp_t gfp_mask = readahead_gfp_mask(mapping);
++
++ if (!isize)
++ goto out;
++
++ end_index = ((isize - 1) >> PAGE_SHIFT);
++
++ /*
++ * Preallocate as many pages as we will need.
++ */
++ for (page_idx = 0; page_idx < nr_to_read; page_idx++) {
++ pgoff_t page_offset = offset + page_idx;
++
++ if (page_offset > end_index)
++ break;
++
++ page = xa_load(&mapping->i_pages, page_offset);
++ if (page && !xa_is_value(page)) {
++ /*
++ * Page already present? Kick off the current batch of
++ * contiguous pages before continuing with the next
++ * batch.
++ */
++ if (nr_pages)
++ read_pages(mapping, &page_pool, nr_pages,
++ gfp_mask);
++ nr_pages = 0;
++ continue;
++ }
++
++ page = __page_cache_alloc(gfp_mask);
++ if (!page)
++ break;
++ page->index = page_offset;
++ list_add(&page->lru, &page_pool);
++ if (page_idx == nr_to_read)
++ SetPageReadahead(page);
++ nr_pages++;
++ }
++
++ /*
++ * Now start the IO. We ignore I/O errors - if the page is not
++ * uptodate then the caller will launch readpage again, and
++ * will then handle the error.
++ */
++ if (nr_pages)
++ read_pages(mapping, &page_pool, nr_pages, gfp_mask);
++ WARN_ON(!list_empty(&page_pool));
++out:
++ return nr_pages;
++}
++
++int exfat_page_cache_readahead(struct address_space *mapping, pgoff_t offset,
++ unsigned long nr_to_read)
++{
++ struct inode *inode = mapping->host;
++ struct backing_dev_info *bdi = inode_to_bdi(inode);
++ unsigned long max_pages;
++
++ if (unlikely(!mapping->a_ops->readpage && !mapping->a_ops->readpages))
++ return -EINVAL;
++
++ /*
++ * If the request exceeds the readahead window, allow the read to
++ * be up to the optimal hardware IO size
++ */
++ max_pages = max_t(unsigned long, bdi->io_pages, 0x200);
++ nr_to_read = min(nr_to_read, max_pages);
++ while (nr_to_read) {
++ unsigned long this_chunk = (2 * 1024 * 1024) / PAGE_SIZE;
++
++ if (this_chunk > nr_to_read)
++ this_chunk = nr_to_read;
++ __exfat_page_cache_readahead(mapping, offset, this_chunk);
++
++ offset += this_chunk;
++ nr_to_read -= this_chunk;
++ }
++ return 0;
++}
++
++static struct kmem_cache *exfat_inode_cachep;
++
++static struct inode *exfat_alloc_inode(struct super_block *sb)
++{
++ struct exfat_inode_info *ei =
++ kmem_cache_alloc(exfat_inode_cachep, GFP_NOFS);
++ if (!ei)
++ return NULL;
++
++ init_rwsem(&ei->truncate_lock);
++
++ ei->i_runs_tree.root = RB_ROOT;
++ ei->i_runs_tree.cache_er = NULL;
++
++ rwlock_init(&ei->i_run_lock);
++
++ return &ei->vfs_inode;
++}
++
++static void exfat_i_callback(struct rcu_head *head)
++{
++ struct inode *inode = container_of(head, struct inode, i_rcu);
++
++ kmem_cache_free(exfat_inode_cachep, exfat_i(inode));
++}
++
++static void exfat_destroy_inode(struct inode *inode)
++{
++ call_rcu(&inode->i_rcu, exfat_i_callback);
++}
++
++static void init_once(void *foo)
++{
++ struct exfat_inode_info *ei = (struct exfat_inode_info *)foo;
++
++ INIT_HLIST_NODE(&ei->i_exfat_hash);
++ inode_init_once(&ei->vfs_inode);
++}
++
++static void sbi_delayed_free(struct rcu_head *p)
++{
++ struct exfat_sb_info *sbi = container_of(p, struct exfat_sb_info, rcu);
++
++ unload_nls(sbi->nls);
++ exfat_heap_free(sbi);
++}
++
++static void exfat_put_super(struct super_block *sb)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++
++ exfat_heap_free(sbi->upcase_tbl);
++ iput(sbi->fat_inode);
++ iput(sbi->bitmap_inode);
++
++ call_rcu(&sbi->rcu, sbi_delayed_free);
++}
++
++static int exfat_statfs(struct dentry *dentry, struct kstatfs *buf)
++{
++ struct super_block *sb = dentry->d_sb;
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ u64 id = huge_encode_dev(sb->s_bdev->bd_dev);
++
++ /* If the count of free cluster is still unknown, counts it here. */
++ if (~0u == sbi->free_clusters) {
++ int err = exfat_count_free_clusters(sb);
++
++ if (err)
++ return err;
++ }
++
++ buf->f_type = sb->s_magic;
++ buf->f_bsize = sbi->cluster_size;
++ buf->f_blocks = sbi->clusters;
++ buf->f_bfree = sbi->free_clusters;
++ buf->f_bavail = sbi->free_clusters;
++ buf->f_fsid.val[0] = (u32)id;
++ buf->f_fsid.val[1] = (u32)(id >> 32);
++ buf->f_namelen = MAX_EXFAT_FILENAME;
++
++ return 0;
++}
++
++static int exfat_show_options(struct seq_file *m, struct dentry *root)
++{
++ struct exfat_sb_info *sbi = exfat_sb(root->d_sb);
++ struct exfat_mount_options *opts = &sbi->options;
++
++ if (!uid_eq(opts->fs_uid, GLOBAL_ROOT_UID))
++ seq_printf(m, ",uid=%u",
++ from_kuid_munged(&init_user_ns, opts->fs_uid));
++ if (!gid_eq(opts->fs_gid, GLOBAL_ROOT_GID))
++ seq_printf(m, ",gid=%u",
++ from_kgid_munged(&init_user_ns, opts->fs_gid));
++ seq_printf(m, ",fmask=%04o", opts->fs_fmask);
++ seq_printf(m, ",dmask=%04o", opts->fs_dmask);
++ if (opts->allow_utime)
++ seq_printf(m, ",allow_utime=%04o", opts->allow_utime);
++ if (sbi->nls)
++ /* strip "cp" prefix from displayed option */
++ seq_printf(m, ",codepage=%s", &sbi->nls->charset[2]);
++ if (opts->quiet)
++ seq_puts(m, ",quiet");
++ if (opts->showexec)
++ seq_puts(m, ",showexec");
++ if (opts->sys_immutable)
++ seq_puts(m, ",sys_immutable");
++ if (opts->flush)
++ seq_puts(m, ",flush");
++ if (opts->tz_set) {
++ if (opts->bias)
++ seq_printf(m, ",bias=%d", opts->bias);
++ else
++ seq_puts(m, ",tz=UTC");
++ }
++ if (opts->discard)
++ seq_puts(m, ",discard");
++ return 0;
++}
++
++static const struct super_operations exfat_sops = {
++ .alloc_inode = exfat_alloc_inode,
++ .destroy_inode = exfat_destroy_inode,
++ .evict_inode = exfat_evict_inode,
++ .put_super = exfat_put_super,
++ .statfs = exfat_statfs,
++ .show_options = exfat_show_options,
++};
++
++static struct inode *exfat_export_get_inode(struct super_block *sb, u64 ino,
++ u32 generation)
++{
++ struct inode *inode = NULL;
++
++ if (ino < EXFAT_MAX_RESERVED_INO)
++ return inode;
++ inode = ilookup(sb, ino);
++
++ if (inode && generation && inode->i_generation != generation) {
++ iput(inode);
++ inode = NULL;
++ }
++
++ return inode;
++}
++
++static struct dentry *exfat_fh_to_dentry(struct super_block *sb,
++ struct fid *fid, int fh_len,
++ int fh_type)
++{
++ return generic_fh_to_dentry(sb, fid, fh_len, fh_type,
++ exfat_export_get_inode);
++}
++
++static struct dentry *exfat_fh_to_parent(struct super_block *sb,
++ struct fid *fid, int fh_len,
++ int fh_type)
++{
++ return generic_fh_to_parent(sb, fid, fh_len, fh_type,
++ exfat_export_get_inode);
++}
++
++static const struct export_operations exfat_export_ops = {
++ .fh_to_dentry = exfat_fh_to_dentry,
++ .fh_to_parent = exfat_fh_to_parent,
++};
++
++/* Returns Gb,Mb to print with "%u.%02u Gb" */
++static u32 format_size_gb(const u64 Bytes, u32 *Mb)
++{
++ // Do simple right 30 bit shift of 64 bit value
++ u64 kBytes = Bytes >> 10;
++ u32 kBytes32 = (u32)kBytes;
++
++ *Mb = (100 * (kBytes32 & 0xfffff) + 0x7ffff) >> 20;
++ WARN_ON(*Mb > 100);
++ if (*Mb >= 100)
++ *Mb = 99;
++
++ return (kBytes32 >> 20) | (((u32)(kBytes >> 32)) << 12);
++}
++
++static const u8 s_OemGuid[] = {
++ 0x46, 0x7e, 0x0c, 0x0a, 0x99, 0x33, 0x21, 0x40,
++ 0x90, 0xc8, 0xfa, 0x6d, 0x38, 0x9c, 0x4b, 0xa2 };
++
++/* returns oem_erase_block */
++static u32 get_oem_erase_block(const void *OEMSector)
++{
++ if (!memcmp(OEMSector, s_OemGuid, 16))
++ return le32_to_cpu(*(u32 *)Add2Ptr(OEMSector, 16));
++
++ return 0;
++}
++
++/* checks boot checksum*/
++static int exfat_check_boot(struct super_block *sb, u32 bootLsn, u8 sector_bits,
++ u32 *boot_check_sum, u32 *erase_block)
++{
++ u32 boot_off = bootLsn << sector_bits;
++ u32 bytes_per_boot = MAIN_CHKSUM_SECTOR << sector_bits;
++ u32 oem_off = (MAIN_OEM_SECTOR - MAIN_BOOT_SECTOR) << sector_bits;
++ u32 off = 0;
++ u32 sum = 0x25d7e;
++ u32 cnt = (bytes_per_boot + (1u << sector_bits)) >> 9;
++ u32 i;
++
++ for (; cnt; cnt -= 1, off += 512) {
++ struct buffer_head *bh =
++ exfat_bread(sb, (boot_off + off) >> sector_bits);
++ if (!bh)
++ return -EIO;
++
++ if (erase_block && off == oem_off)
++ *erase_block = get_oem_erase_block(bh->b_data);
++
++ if (off < bytes_per_boot) {
++ const u8 *p = (u8 *)bh->b_data;
++
++ i = 0;
++ if (!off) {
++ /* First 0x40 bytes always the same */
++ p += 0x40;
++ i = 0x40;
++ }
++
++ for (; i < 512; i++, p++) {
++ // Skip 'ex_flags' and 'percent_in_use'
++ if (!off
++ && (i == 0x6a || i == 0x6b || i == 0x70))
++ continue;
++ sum = exfat_check_sum_32(sum, *p);
++ }
++ } else {
++ const __le32 *p = (__le32 *)bh->b_data;
++
++ if (off == bytes_per_boot) {
++ *boot_check_sum = sum;
++ sum = cpu_to_le32(sum);
++ }
++
++ for (i = 0; i < 512 / sizeof(int); i++) {
++ if (sum != *p++) {
++ exfat_warning(sb,
++ "boot check sum failed");
++ brelse(bh);
++ return -EINVAL;
++ }
++ }
++ }
++
++ brelse(bh);
++ }
++
++ return 0;
++}
++
++/* inits internal info from on-disk boot sector*/
++static int exfat_init_from_boot(struct super_block *sb, struct exfat_boot *boot,
++ u64 bytes_per_volume, u32 *root_lcn)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct buffer_head *backup_bh = NULL;
++ const char *hint = NULL;
++ int err;
++ u8 sector_bits;
++ u32 mb, gb;
++ u32 boot_checksum1 = 0, boot_checksum2 = 0;
++ u32 erase_block1 = 0, erase_block2 = 0;
++ u64 heap64;
++ u32 sb_blocksize;
++ u64 last_lsn;
++ u32 i;
++ u32 sector_size;
++ u64 boot_bytes_per_volume;
++ u64 partition_offset;
++ u32 fat_lsn;
++ u32 fat_len;
++ u32 cluster_heap;
++ u32 clusters;
++ u64 sectors_per_volume;
++
++check_boot:
++ err = -EINVAL;
++
++ if (boot->jump_code[0] != 0xeb || boot->jump_code[1] != 0x76 ||
++ boot->jump_code[2] != 0x90) {
++ hint = "invalid jump code";
++ goto out;
++ }
++
++ if (boot->oemid[0] != 'E' || boot->oemid[1] != 'X' ||
++ boot->oemid[2] != 'F' || boot->oemid[3] != 'A' ||
++ boot->oemid[4] != 'T' || boot->oemid[5] != ' ' ||
++ boot->oemid[6] != ' ' || boot->oemid[7] != ' ') {
++ hint = "invalid oem signature";
++ goto out;
++ }
++
++ for (i = 0; i < sizeof(boot->zero); i++) {
++ if (boot->zero[i]) {
++ hint = "invalid zero zone";
++ goto out;
++ }
++ }
++
++ sector_bits = boot->sector_bits;
++ sector_size = 1u << sector_bits;
++ if (sector_bits < 9 || sector_bits > 12) {
++ hint = "invalid sector size";
++ goto out;
++ }
++
++ if (boot->sct_per_clst_bits > 16) {
++ hint = "invalid cluster size";
++ goto out;
++ }
++
++ if (boot->fats != 1) {
++ hint = "This version of exfat driver does not support TexFat";
++ goto out;
++ }
++
++ fat_lsn = le32_to_cpu(boot->fat_lsn);
++ if (fat_lsn < 24) {
++ hint = "invalid fat offset";
++ goto out;
++ }
++
++ fat_len = le32_to_cpu(boot->fat_len);
++ cluster_heap = le32_to_cpu(boot->cluster_heap_lsn);
++ if (fat_lsn + fat_len > cluster_heap) {
++ hint = "invalid fat length";
++ goto out;
++ }
++
++ clusters = le32_to_cpu(boot->clusters);
++ if (!clusters ||
++ (fat_len << (sector_bits - 2)) < clusters + EXFAT_CLUSTER_MIN) {
++ hint = "invalid clusters count";
++ goto out;
++ }
++
++ sectors_per_volume = le64_to_cpu(boot->sectors_per_volume);
++ last_lsn = cluster_heap + ((u64)clusters << boot->sct_per_clst_bits);
++ boot_bytes_per_volume = sectors_per_volume << sector_bits;
++
++ if (last_lsn > sectors_per_volume) {
++ hint = "invalid cluster_heap";
++ goto out;
++ }
++
++ *root_lcn = le32_to_cpu(boot->root_lcn);
++ if (*root_lcn < EXFAT_CLUSTER_FIRST ||
++ *root_lcn - EXFAT_CLUSTER_FIRST >= clusters) {
++ hint = "invalid root_lcn";
++ goto out;
++ }
++
++ if (boot->major > 1) {
++ hint = "unsupported major version";
++ goto out;
++ }
++
++ if (0x55 != boot->signature[0] || 0xAA != boot->signature[1]) {
++ hint = "invalid boot signature";
++ goto out;
++ }
++
++ ClearFlag(sbi->flags,
++ EXFAT_FLAGS_BOOT1_VALID | EXFAT_FLAGS_BOOT2_VALID);
++
++ err = exfat_check_boot(sb, MAIN_BOOT_SECTOR, sector_bits,
++ &boot_checksum1, &erase_block1);
++ if (!err)
++ SetFlag(sbi->flags, EXFAT_FLAGS_BOOT1_VALID);
++
++ err = exfat_check_boot(sb, BACKUP_BOOT_SECTOR, sector_bits,
++ &boot_checksum2, &erase_block2);
++ if (!err)
++ SetFlag(sbi->flags, EXFAT_FLAGS_BOOT2_VALID);
++
++ if (erase_block1)
++ exfat_trace(sb, "Found OEM erase block info: %x at master boot",
++ erase_block1);
++ if (erase_block2)
++ exfat_trace(sb, "Found OEM erase block info: %x at backup boot",
++ erase_block2);
++
++ if ((EXFAT_FLAGS_BOOT1_VALID | EXFAT_FLAGS_BOOT2_VALID) ==
++ (sbi->flags &
++ (EXFAT_FLAGS_BOOT1_VALID | EXFAT_FLAGS_BOOT2_VALID))) {
++ // Both boot are valid
++ WARN_ON(boot_checksum1 != boot_checksum2);
++ WARN_ON(erase_block1 != erase_block2);
++ if (boot_checksum1 != boot_checksum2) {
++ exfat_trace(sb,
++ "Primary and Backup boot does not match");
++ ClearFlag(sbi->flags, EXFAT_FLAGS_BOOT2_VALID);
++ }
++ } else if (0 == (sbi->flags &
++ (EXFAT_FLAGS_BOOT1_VALID | EXFAT_FLAGS_BOOT2_VALID))) {
++ // Both boot are invalid
++ hint = "primary and backup boots both inconsistent";
++ err = -EINVAL;
++ goto out;
++ } else if (backup_bh) {
++ } else if (!FlagOn(sbi->flags, EXFAT_FLAGS_BOOT1_VALID)) {
++ exfat_trace(sb, "use backup boot instead of primary");
++
++ backup_bh = exfat_bread(sb, BACKUP_BOOT_SECTOR);
++ if (!backup_bh) {
++ err = -EIO;
++ goto out;
++ }
++
++ boot = (struct exfat_boot *)backup_bh->b_data;
++ goto check_boot;
++ } else {
++ exfat_trace(sb,
++ "use primary boot, backup boot is not consistent");
++ }
++
++ partition_offset = le64_to_cpu(boot->partition_offset);
++ sbi->cluster_bits = boot->sct_per_clst_bits + sector_bits;
++ sbi->cluster_size = 1u << sbi->cluster_bits;
++ sbi->cluster_mask = sbi->cluster_size - 1;
++ fat_lsn = le32_to_cpu(boot->fat_lsn);
++ fat_len = le32_to_cpu(boot->fat_len);
++ sbi->clusters = clusters;
++ sbi->serial_num = le32_to_cpu(boot->serial_num);
++ sbi->ex_flags = boot->ex_flags_lo;
++ sbi->bytes_per_fat = (u64)fat_len << sector_bits;
++ sbi->fat0_pbo = (u64)fat_lsn << sector_bits;
++ heap64 = (u64)cluster_heap << sector_bits;
++ sbi->cluster_heap = heap64 - (EXFAT_CLUSTER_FIRST * sbi->cluster_size);
++ if (FlagOn(boot->ex_flags_lo, BOOT_FLAG_DIRTY))
++ sbi->dirty = true;
++
++ /* Select block size to operate */
++ sb_blocksize = sbi->cluster_size;
++ if (sb_blocksize > PAGE_SIZE)
++ sb_blocksize = PAGE_SIZE;
++
++ while (sb_blocksize > sbi->fat0_pbo)
++ sb_blocksize >>= 1;
++
++ while (0 != (sbi->fat0_pbo & (sb_blocksize - 1)))
++ sb_blocksize >>= 1;
++
++ while (0 != (heap64 & (sb_blocksize - 1)))
++ sb_blocksize >>= 1;
++
++ sb_set_blocksize(sb, sb_blocksize);
++ WARN_ON(sb->s_blocksize != sb_blocksize);
++
++ sbi->blocksize_mask = sb_blocksize - 1;
++ sbi->blocks_per_cluster = 1u
++ << (sbi->cluster_bits - sb->s_blocksize_bits);
++ sbi->blocks_per_volume = bytes_per_volume >> sb->s_blocksize_bits;
++
++ gb = format_size_gb(boot_bytes_per_volume, &mb);
++
++ /* Check fs size and volume size */
++ if (bytes_per_volume < boot_bytes_per_volume) {
++ u32 mb0, gb0;
++
++ gb0 = format_size_gb(bytes_per_volume, &mb0);
++
++ exfat_trace(
++ sb,
++ "RAW ExFat volume: filesystem size %u.%02u Gb > volume size %u.%02u Gb. Mount in read-only",
++ gb, mb, gb0, mb0);
++ sb->s_flags |= SB_RDONLY;
++ }
++
++ exfat_trace(
++ sb,
++ "Volume %04X-%04X is initiated as exFAT of size %u.%02u Gb%s",
++ sbi->serial_num >> 16, sbi->serial_num & 0xFFFF, gb, mb,
++ sbi->dirty ? ", dirty" : "");
++
++out:
++ brelse(backup_bh);
++ return err;
++}
++
++/* create root inode */
++static int exfat_create_root(struct super_block *sb, u32 root_lcn)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ struct inode *root_inode;
++ struct exfat_inode_info *ei;
++ u32 len;
++ int err;
++
++ root_inode = new_inode(sb);
++ if (!root_inode)
++ return -ENOMEM;
++
++ root_inode->i_ino = EXFAT_ROOT_INO;
++ inode_set_iversion(root_inode, 1);
++
++ ei = exfat_i(root_inode);
++ ei->i_stream_flags = 0; /* use fat to load chain. see exfat_load_runs*/
++ root_inode->i_uid = sbi->options.fs_uid;
++ root_inode->i_gid = sbi->options.fs_gid;
++ inode_inc_iversion(root_inode);
++ root_inode->i_generation = 0;
++ root_inode->i_mode = exfat_make_mode(sbi, ENTRY_ATTR_DIR, 0777);
++ root_inode->i_op = &exfat_dir_inode_operations;
++ root_inode->i_fop = &exfat_dir_operations;
++ ei->i_lcn0 = root_lcn;
++
++ err = exfat_load_runs(root_inode, &len);
++ if (err)
++ goto out;
++
++ root_inode->i_size = ei->i_valid = (loff_t)len << sbi->cluster_bits;
++ if (root_inode->i_size > MAX_BYTES_PER_DIRECTORY) {
++ exfat_fs_error(sb, "root directory is too large",
++ root_inode->i_size);
++ err = -EINVAL;
++ goto out;
++ }
++ root_inode->i_blocks = root_inode->i_size >> 9;
++ exfat_save_attrs(root_inode, ENTRY_ATTR_DIR);
++ root_inode->i_mtime.tv_sec = root_inode->i_atime.tv_sec =
++ root_inode->i_ctime.tv_sec = 0;
++ root_inode->i_mtime.tv_nsec = root_inode->i_atime.tv_nsec =
++ root_inode->i_ctime.tv_nsec = 0;
++ set_nlink(root_inode, 2); // will be filled in exfat_scan_root
++
++ insert_inode_hash(root_inode);
++ // exfat_attach(root_inode, 0);
++
++ sb->s_root = d_make_root(root_inode);
++ if (!sb->s_root) {
++ err = -ENOMEM;
++ goto out;
++ }
++
++ return 0;
++
++out:
++ iput(root_inode);
++ return err;
++}
++
++enum {
++ Opt_uid, Opt_gid, Opt_umask, Opt_dmask, Opt_fmask, Opt_allow_utime,
++ Opt_codepage, Opt_quiet, Opt_showexec, Opt_debug, Opt_immutable,
++ Opt_utf8_no, Opt_utf8_yes, Opt_uni_xl_no, Opt_uni_xl_yes, Opt_flush,
++ Opt_tz_utc, Opt_discard, Opt_nfs, Opt_bias, Opt_err,
++};
++
++static const match_table_t fat_tokens = {
++ { Opt_uid, "uid=%u" },
++ { Opt_gid, "gid=%u" },
++ { Opt_umask, "umask=%o" },
++ { Opt_dmask, "dmask=%o" },
++ { Opt_fmask, "fmask=%o" },
++ { Opt_allow_utime, "allow_utime=%o" },
++ { Opt_codepage, "codepage=%u" },
++ { Opt_quiet, "quiet" },
++ { Opt_showexec, "showexec" },
++ { Opt_debug, "debug" },
++ { Opt_immutable, "sys_immutable" },
++ { Opt_flush, "flush" },
++ { Opt_tz_utc, "tz=UTC" },
++ { Opt_bias, "bias=%d" },
++ { Opt_discard, "discard" },
++ { Opt_utf8_no, "utf8=0" }, /* 0 or no or false */
++ { Opt_utf8_no, "utf8=no" },
++ { Opt_utf8_no, "utf8=false" },
++ { Opt_utf8_yes, "utf8=1" }, /* empty or 1 or yes or true */
++ { Opt_utf8_yes, "utf8=yes" },
++ { Opt_utf8_yes, "utf8=true" },
++ { Opt_utf8_yes, "utf8" },
++ { Opt_uni_xl_no, "uni_xlate=0" }, /* 0 or no or false */
++ { Opt_uni_xl_no, "uni_xlate=no" },
++ { Opt_uni_xl_no, "uni_xlate=false" },
++ { Opt_uni_xl_yes, "uni_xlate=1" }, /* empty or 1 or yes or true */
++ { Opt_uni_xl_yes, "uni_xlate=yes" },
++ { Opt_uni_xl_yes, "uni_xlate=true" },
++ { Opt_uni_xl_yes, "uni_xlate" },
++ { Opt_err, NULL }
++};
++
++static int exfat_parse_options(struct super_block *sb, char *options,
++ int silent, int *debug,
++ struct exfat_mount_options *opts)
++{
++ char *p;
++ substring_t args[MAX_OPT_ARGS];
++ int option;
++
++ opts->fs_uid = current_uid();
++ opts->fs_gid = current_gid();
++ opts->fs_fmask = opts->fs_dmask = current_umask();
++ opts->allow_utime = -1;
++ opts->quiet = opts->showexec = opts->sys_immutable = 0;
++ opts->unicode_xlate = 0;
++ opts->tz_set = 0;
++
++ *debug = 0;
++
++#ifdef CONFIG_EXFAT_RO_FS_DEFAULT_CODEPAGE
++ opts->codepage = CONFIG_EXFAT_RO_FS_DEFAULT_CODEPAGE;
++#endif
++
++#ifdef EXFAT_RO_FS_DEFAULT_UTF8
++ opts->utf8 = 1;
++#endif
++
++ if (!options)
++ goto out;
++
++ while ((p = strsep(&options, ","))) {
++ int token;
++
++ if (!*p)
++ continue;
++
++ token = match_token(p, fat_tokens, args);
++ switch (token) {
++ case Opt_quiet:
++ opts->quiet = 1;
++ break;
++ case Opt_showexec:
++ opts->showexec = 1;
++ break;
++ case Opt_debug:
++ *debug = 1;
++ break;
++ case Opt_immutable:
++ opts->sys_immutable = 1;
++ break;
++ case Opt_uid:
++ if (match_int(&args[0], &option))
++ return -EINVAL;
++ opts->fs_uid = make_kuid(current_user_ns(), option);
++ if (!uid_valid(opts->fs_uid))
++ return -EINVAL;
++ break;
++ case Opt_gid:
++ if (match_int(&args[0], &option))
++ return -EINVAL;
++ opts->fs_gid = make_kgid(current_user_ns(), option);
++ if (!gid_valid(opts->fs_gid))
++ return -EINVAL;
++ break;
++ case Opt_umask:
++ if (match_octal(&args[0], &option))
++ return -EINVAL;
++ opts->fs_fmask = opts->fs_dmask = option;
++ break;
++ case Opt_dmask:
++ if (match_octal(&args[0], &option))
++ return -EINVAL;
++ opts->fs_dmask = option;
++ break;
++ case Opt_fmask:
++ if (match_octal(&args[0], &option))
++ return -EINVAL;
++ opts->fs_fmask = option;
++ break;
++ case Opt_allow_utime:
++ if (match_octal(&args[0], &option))
++ return -EINVAL;
++ opts->allow_utime = option & 0022;
++ break;
++ case Opt_codepage:
++ if (match_int(&args[0], &option))
++ return -EINVAL;
++ opts->codepage = option;
++ break;
++ case Opt_flush:
++ opts->flush = 1;
++ break;
++ case Opt_bias:
++ if (match_int(&args[0], &option))
++ return -EINVAL;
++ /* GMT+-12 zones may have DST corrections so at least*/
++ /* 13 hours difference is needed. Make the limit 24*/
++ /* just in case someone invents something unusual.*/
++ if (option < -24 * 60 || option > 24 * 60)
++ return -EINVAL;
++ opts->tz_set = 1;
++ opts->bias = option;
++ break;
++ case Opt_tz_utc:
++ opts->tz_set = 1;
++ opts->bias = 0;
++ break;
++ case Opt_utf8_no: /* 0 or no or false */
++ opts->utf8 = 0;
++ break;
++ case Opt_utf8_yes: /* empty or 1 or yes or true */
++ opts->utf8 = 1;
++ break;
++ case Opt_uni_xl_no: /* 0 or no or false */
++ opts->unicode_xlate = 0;
++ break;
++ case Opt_uni_xl_yes: /* empty or 1 or yes or true */
++ opts->unicode_xlate = 1;
++ break;
++ case Opt_discard:
++ opts->discard = 1;
++ break;
++
++ /* unknown option */
++ default:
++ if (!silent)
++ __exfat_trace(
++ sb, KERN_ERR,
++ "Unrecognized mount option \"%s\" or missing value",
++ p);
++ return -EINVAL;
++ }
++ }
++
++out:
++ /* If user doesn't specify allow_utime, it's initialized from dmask. */
++ if (opts->allow_utime == (u16)-1)
++ opts->allow_utime = ~opts->fs_dmask & 0022;
++ if (opts->unicode_xlate)
++ opts->utf8 = 0;
++
++ return 0;
++}
++
++static struct inode *exfat_new_dummy(struct super_block *sb, u32 ino)
++{
++ struct exfat_inode_info *ei;
++ struct inode *inode = new_inode(sb);
++
++ if (!inode)
++ return NULL;
++
++ inode->i_ino = ino;
++ WARN_ON(inode->i_sb != sb);
++
++ ei = exfat_i(inode);
++ ei->i_valid = 0;
++ ei->i_lcn0 = 0;
++ ei->i_attrs = 0;
++ memset(ei->i_pos, 0, sizeof(ei->i_pos));
++
++ inode->i_mapping->a_ops = &exfat_aops;
++ return inode;
++}
++
++static const char s_magic[] = "EXFAT";
++
++/* try to mount*/
++static int exfat_fill_super(struct super_block *sb, void *data, int silent)
++{
++ int err;
++ struct buffer_head *bh = NULL;
++ struct exfat_sb_info *sbi;
++ struct block_device *bdev = sb->s_bdev;
++ int debug;
++ u32 i, root_lcn;
++
++ sbi = exfat_heap_alloc(sizeof(struct exfat_sb_info), true);
++ if (!sbi)
++ return -ENOMEM;
++
++ sb->s_fs_info = sbi;
++ sbi->sb = sb;
++ sb->s_flags |= SB_RDONLY | SB_NODIRATIME;
++ sb->s_magic = *(unsigned long *)s_magic; // TODO
++ sb->s_op = &exfat_sops;
++ sb->s_export_op = &exfat_export_ops;
++ sb->s_time_gran = 10000000;
++
++ ratelimit_state_init(&sbi->ratelimit, DEFAULT_RATELIMIT_INTERVAL,
++ DEFAULT_RATELIMIT_BURST);
++
++ mutex_init(&sbi->s_lock);
++
++ /* set up enough so that it can read an inode */
++ spin_lock_init(&sbi->inode_hash_lock);
++ for (i = 0; i < EXFAT_HASH_SIZE; i++)
++ INIT_HLIST_HEAD(&sbi->inode_hashtable[i]);
++
++ mutex_init(&sbi->exfat_lock);
++
++ err = exfat_parse_options(sb, data, silent, &debug, &sbi->options);
++ if (err)
++ goto out;
++
++ sbi->nls = load_nls_default();
++ if (!sbi->nls) {
++ __exfat_trace(sb, KERN_ERR, "failed to load default nls");
++ err = -EINVAL;
++ goto out;
++ }
++
++ sb_min_blocksize(sb, 512);
++ sbi->blocks_per_volume = bdev->bd_inode->i_size >> sb->s_blocksize_bits;
++ bh = exfat_bread(sb, 0);
++ if (!bh) {
++ err = -EIO;
++ goto out;
++ }
++
++ err = exfat_init_from_boot(sb, (struct exfat_boot *)bh->b_data,
++ bdev->bd_inode->i_size, &root_lcn);
++ if (err)
++ goto out;
++
++ sb->s_maxbytes = (u64)sbi->clusters << sbi->cluster_bits;
++ sbi->free_clusters = ~0u;
++ sbi->first_free_cluster = ~0u;
++
++ sbi->fat_inode = exfat_new_dummy(sb, EXFAT_FAT_INO);
++ if (!sbi->fat_inode) {
++ err = -ENOMEM;
++ goto out;
++ }
++
++ sbi->fat_inode->i_size = sbi->bytes_per_fat;
++
++ sbi->bitmap_inode = exfat_new_dummy(sb, EXFAT_BITMAP_INO);
++ if (!sbi->bitmap_inode) {
++ err = -ENOMEM;
++ goto out;
++ }
++
++ err = exfat_create_root(sb, root_lcn);
++ if (err)
++ goto out;
++
++ err = exfat_scan_root(sb);
++ if (err)
++ goto out;
++
++ return 0;
++
++out:
++ brelse(bh);
++ iput(sbi->fat_inode);
++ iput(sbi->bitmap_inode);
++ if (sb->s_root) {
++ iput(sb->s_root->d_inode);
++ d_drop(sb->s_root);
++ sb->s_root = NULL;
++ }
++
++ unload_nls(sbi->nls);
++ sb->s_fs_info = NULL;
++ exfat_heap_free(sbi);
++
++ return err;
++}
++
++static struct dentry *exfat_mount(struct file_system_type *fs_type, int flags,
++ const char *dev_name, void *data)
++{
++ return mount_bdev(fs_type, flags, dev_name, data, exfat_fill_super);
++}
++
++static struct file_system_type exfat_fs_type = {
++ .owner = THIS_MODULE,
++ .name = "exfat",
++ .mount = exfat_mount,
++ .kill_sb = kill_block_super,
++ .fs_flags = FS_REQUIRES_DEV,
++};
++MODULE_ALIAS_FS("exfat");
++
++// How many seconds since 1970 till 1980
++#define Seconds1970To1980 0x12CEA600
++
++static int __init init_exfat_fs(void)
++{
++ int err;
++ struct timespec64 ts;
++
++ /* exfat stores dates relative 1980.*/
++ ktime_get_coarse_real_ts64(&ts);
++ if (ts.tv_sec < Seconds1970To1980)
++ pr_notice(
++ "exfat can't store dates before Jan 1, 1980. Please update current date\n");
++
++ err = exfat_run_cache_init();
++ if (err)
++ return err;
++
++ exfat_inode_cachep = kmem_cache_create(
++ "exfat_inode_cache", sizeof(struct exfat_inode_info), 0,
++ (SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD | SLAB_ACCOUNT),
++ init_once);
++ if (!exfat_inode_cachep) {
++ err = -ENOMEM;
++ goto failed;
++ }
++
++ err = register_filesystem(&exfat_fs_type);
++ if (!err)
++ return 0;
++
++failed:
++ exfat_run_cache_exit();
++ return err;
++}
++
++static void __exit exit_exfat_fs(void)
++{
++ exfat_run_cache_exit();
++ if (exfat_inode_cachep) {
++ rcu_barrier();
++ kmem_cache_destroy(exfat_inode_cachep);
++ }
++
++ unregister_filesystem(&exfat_fs_type);
++}
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("exfat filesystem");
++MODULE_AUTHOR("Konstantin Komarov");
++
++module_init(init_exfat_fs) module_exit(exit_exfat_fs)
+diff --git a/fs/exfat/upcase.c b/fs/exfat/upcase.c
+new file mode 100644
+index 000000000000..c3b9ede6cbbb
+--- /dev/null
++++ b/fs/exfat/upcase.c
+@@ -0,0 +1,344 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * linux/fs/exfat/upcase.c
++ *
++ * Copyright (c) 2010-2019 Paragon Software GmbH, All rights reserved.
++ *
++ */
++
++#include <linux/module.h>
++
++#include "debug.h"
++#include "exfat.h"
++#include "exfat_fs.h"
++
++/* Used in RtlUpcaseUnicodeChar */
++static const u16 s_Upcase[] = {
++ 0x0140, 0x01b0, 0x01a0, 0x0130, 0x0180, 0x0190, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0120, 0x01c0, 0x01d0, 0x0100, 0x0150, 0x0100, 0x0100,
++ 0x0110, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0170,
++ 0x01e0, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100, 0x0100,
++ 0x0100, 0x0100, 0x0100, 0x0160, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x0530, 0x0520, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x0210, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x0240, 0x01f0, 0x01f0, 0x0220,
++ 0x0350, 0x0510, 0x0250, 0x03e0, 0x02d0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x0350, 0x04f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x0500, 0x04e0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x0200, 0x01f0,
++ 0x01f0, 0x0540, 0x0280, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x0350, 0x04f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x04d0, 0x04d0, 0x04c0, 0x0370, 0x0270, 0x03e0, 0x03e0,
++ 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x0380, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x0500, 0x0500, 0x04a0, 0x03e0, 0x03e0, 0x0360, 0x03e0, 0x03e0, 0x03e0,
++ 0x0320, 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x0380, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x0340, 0x04d0, 0x04b0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x03e0, 0x03e0, 0x02c0, 0x0390, 0x0300, 0x0290, 0x0490,
++ 0x02f0, 0x0480, 0x02e0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x03e0, 0x03e0, 0x03e0, 0x02b0, 0x0560, 0x03e0, 0x03e0, 0x03c0, 0x0450,
++ 0x0310, 0x03b0, 0x0550, 0x0260, 0x0570, 0x03e0, 0x02a0, 0x03e0, 0x03e0,
++ 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x03a0, 0x03e0,
++ 0x03e0, 0x03e0, 0x03e0, 0x03e0, 0x03d0, 0x0430, 0x0420, 0x0430, 0x0430,
++ 0x0420, 0x0330, 0x0430, 0x0440, 0x0430, 0x0430, 0x0430, 0x0410, 0x0230,
++ 0x03f0, 0x0400, 0x0230, 0x0470, 0x0470, 0x0460, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0, 0x01f0,
++ 0x01f0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0xffe4, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0ee6, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffda, 0xffdb,
++ 0xffdb, 0xffdb, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xfff7, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0082, 0x0082, 0x0082, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0xfffe, 0x0000, 0x0000, 0xfffe, 0x0000, 0x0000, 0xfffe,
++ 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0xff2e, 0xff32, 0x0000, 0xff33, 0xff33, 0x0000, 0xff36,
++ 0x0000, 0xff35, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0xfffe, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff,
++ 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff,
++ 0x0000, 0x0000, 0x0007, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff,
++ 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0xff25, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xff2b, 0x0000,
++ 0x0000, 0xff2a, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x29e7, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0061, 0x0000, 0x0000,
++ 0x0000, 0xffff, 0x00a3, 0x0000, 0x0000, 0x0000, 0x0082, 0x0000, 0x0000,
++ 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0xfff1, 0x0000, 0x0008, 0x0000,
++ 0x0008, 0x0000, 0x0008, 0x0000, 0x0008, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffd0, 0xffd0, 0xffd0, 0xffd0,
++ 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0,
++ 0xffd0, 0xffd0, 0x0000, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff,
++ 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x2a2b, 0x0000, 0xffff, 0x0000, 0x2a28,
++ 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0xffff, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff,
++ 0x0008, 0x0008, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0008, 0x0008,
++ 0x0000, 0x0000, 0x0000, 0x0007, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0008, 0x0008, 0x0000, 0x0009,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0008, 0x0008, 0x0008, 0x0008, 0x0008, 0x0008,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0008, 0x0008, 0x0008, 0x0008, 0x0008, 0x0008, 0x0008, 0x0008,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x004a,
++ 0x004a, 0x0056, 0x0056, 0x0056, 0x0056, 0x0064, 0x0064, 0x0080, 0x0080,
++ 0x0070, 0x0070, 0x007e, 0x007e, 0x0000, 0x0000, 0x00c3, 0x0000, 0x0000,
++ 0xffff, 0x0000, 0xffff, 0x0000, 0x0000, 0xffff, 0x0000, 0x0000, 0x0000,
++ 0xffff, 0x0000, 0x0000, 0x0000, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0,
++ 0xe3a0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0,
++ 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0, 0xe3a0,
++ 0xff26, 0x0000, 0x0000, 0xff26, 0x0000, 0x0000, 0x0000, 0x0000, 0xff26,
++ 0xffbb, 0xff27, 0xff27, 0xffb9, 0x0000, 0x0000, 0x0000, 0xff33, 0x0000,
++ 0x0000, 0xff31, 0x0000, 0x0000, 0x0000, 0x0000, 0xff2f, 0xff2d, 0x0000,
++ 0x29f7, 0x0000, 0x0000, 0x0000, 0xff2d, 0xffb0, 0xffb0, 0xffb0, 0xffb0,
++ 0xffb0, 0xffb0, 0xffb0, 0xffb0, 0xffb0, 0xffb0, 0xffb0, 0xffb0, 0xffb0,
++ 0xffb0, 0xffb0, 0xffb0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0,
++ 0xffd0, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0,
++ 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0x0000, 0xffd0,
++ 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0,
++ 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffd0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0x0000, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe0, 0x0079, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0x0000, 0x0000, 0x0000,
++ 0x0000, 0x0000, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe1, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0, 0xffe0,
++ 0xffe0, 0xffe0, 0xffe0, 0xffc0, 0xffc1, 0xffc1, 0x0000, 0xffe6, 0xffe6,
++ 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0x0000,
++ 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0xffe6, 0xffe6, 0xffe6, 0xffe6,
++ 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6, 0xffe6,
++ 0xffe6, 0xffe6, 0xffe6, 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0,
++ 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0, 0xfff0,
++ 0xfff0, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0x0000, 0xffff, 0x0000, 0x0000, 0x0000, 0xffff, 0x0000, 0x0038, 0xffff,
++ 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0xffff, 0x0000, 0xffff,
++ 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000, 0xffff, 0x0000,
++ 0xffff, 0xffb1, 0x0000, 0xffff,
++};
++
++/* This function converts the specified Unicode character to uppercase */
++static inline u16 upcase_unicode_char_ex(const u16 *upcase, u16 chr)
++{
++ if (chr < 'a')
++ return chr;
++
++ if (chr <= 'z')
++ return chr - ('a' - 'A');
++
++ return chr + upcase[upcase[upcase[chr >> 8] + ((chr >> 4) & 0xF)] +
++ (chr & 0xF)];
++}
++
++/* This function creates upcase table for ExFat */
++void create_up_case(u16 *Buffer)
++{
++ u16 i;
++ // Fill the default values
++ for (i = 0; i < ARRAY_SIZE(s_Upcase); i++)
++ Buffer[i] = upcase_unicode_char_ex(s_Upcase, i);
++}
++
++/* UnPacks packed upcase */
++static bool unpack_upcase(struct super_block *sb, const __le16 *packed,
++ u32 bytes_per_packed, bool *hole, u16 *unpacked,
++ u32 *pos)
++{
++ u16 *up = unpacked + *pos;
++ //
++ // Analyze compressed 'upcase' cluster
++ //
++ while (bytes_per_packed >= sizeof(short)) {
++ u16 uc = le16_to_cpu(*packed++);
++
++ if (*hole) {
++ if (*pos + uc > 0x10000) {
++ exfat_trace(sb, "Invalid upcase_tbl table (1)");
++ return false;
++ }
++
++ while (uc--) {
++ *up++ = (u16)*pos;
++ *pos += 1;
++ }
++
++ *hole = false;
++ } else if (uc == 0xFFFF)
++ *hole = true;
++ else {
++ if (*pos >= 0x10000) {
++ exfat_trace(sb, "Invalid upcase_tbl table (2)");
++ return false;
++ }
++ *up++ = uc;
++ *pos += 1;
++ }
++
++ bytes_per_packed -= sizeof(short);
++ }
++
++ WARN_ON(bytes_per_packed);
++ return true;
++}
++
++/* Loads upcase from roots exfat_direntry::upcase */
++int exfat_load_upcase(struct super_block *sb, const union exfat_direntry *de,
++ bool usedefault_if_error)
++{
++ struct exfat_sb_info *sbi = sb->s_fs_info;
++ bool hole = false;
++ int err = 0;
++ u32 pos = 0;
++ u32 checksum = 0;
++ u32 lcn = le32_to_cpu(de->upcase.start_lcn);
++ u64 bytes_per_file64 = le64_to_cpu(de->upcase.size);
++ u32 bytes_per_file = bytes_per_file64;
++ u32 vbo, next_lcn;
++ struct exfat_entry exfat_entry;
++
++ static_assert(0x10000 == (1u << (8 * sizeof(short))));
++ WARN_ON(de->type != ENTRY_TYPE_UPCASE);
++
++ // Check the size of upcase_tbl file
++ if (bytes_per_file != bytes_per_file64 || !exfat_valid_lcn(sbi, lcn)) {
++ exfat_trace(sb, "Invalid upcase_tbl fat chain");
++ return -EINVAL;
++ }
++
++ WARN_ON(sbi->upcase_tbl);
++ sbi->upcase_tbl = (u16 *)exfat_heap_alloc(0x10000 * sizeof(u16), true);
++ if (!sbi->upcase_tbl)
++ return -ENOMEM;
++
++ memset(&exfat_entry, 0, sizeof(exfat_entry));
++
++ for (vbo = 0; vbo < bytes_per_file;
++ vbo += sbi->cluster_size, lcn = next_lcn) {
++ u32 off;
++ u64 pbo = exfat_lcn_to_pbo(sbi, lcn);
++
++ for (off = 0;
++ off < sbi->cluster_size && vbo + off < bytes_per_file;
++ off += sb->s_blocksize, pbo += sb->s_blocksize) {
++ bool bOk;
++ u32 bytes;
++ sector_t pbn = pbo >> sb->s_blocksize_bits;
++ struct buffer_head *bh = exfat_bread(sb, pbn);
++
++ if (!bh) {
++ err = -EIO;
++ goto out;
++ }
++
++ bytes = bytes_per_file - (vbo + off);
++ if (bytes > sb->s_blocksize)
++ bytes = sb->s_blocksize;
++
++ bOk = unpack_upcase(sb, (__le16 *)bh->b_data, bytes,
++ &hole, sbi->upcase_tbl, &pos);
++
++ if (bOk) {
++ const u8 *p;
++
++ for (p = bh->b_data; bytes--;)
++ checksum = exfat_check_sum_32(checksum,
++ *p++);
++ }
++
++ brelse(bh);
++
++ if (!bOk) {
++ exfat_trace(sb, "Invalid upcase_tbl table (1)");
++ err = -EINVAL;
++ goto out;
++ }
++ }
++
++ err = exfat_fat_get(sb, &exfat_entry, lcn, &next_lcn);
++ if (err)
++ goto out;
++ }
++
++ if (le32_to_cpu(de->upcase.checksum) != checksum) {
++ exfat_trace(sb, "checksum failed for upcase_tbl table");
++ err = -EINVAL;
++ goto out;
++ }
++
++ if (hole) {
++ u16 *p = sbi->upcase_tbl + pos;
++
++ for (; pos < 0x10000; pos++)
++ *p++ = pos;
++ }
++
++ return 0;
++
++out:
++ if (usedefault_if_error) {
++ /* Generate default upcase_tbl file */
++ exfat_fs_error(
++ sb,
++ "Failed to read upcase_tbl file: use the default one, mount in read-only");
++ create_up_case(sbi->upcase_tbl);
++ err = 0;
++ }
++
++ return err;
++}
