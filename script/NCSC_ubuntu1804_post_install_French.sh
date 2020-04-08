@@ -6,12 +6,12 @@ function promptPassphrase {
 	PASS=""
 	PASSCONF=""
 	while [ -z "$PASS" ]; do
-		read -s -p "Passphrase: " PASS
+		read -s -p "Mot de passe: " PASS
 		echo ""
 	done
 	
 	while [ -z "$PASSCONF" ]; do
-		read -s -p "Confirm passphrase: " PASSCONF
+		read -s -p "Confirmer le mot de passe: " PASSCONF
 		echo ""
 	done
 	echo ""
@@ -20,19 +20,19 @@ function promptPassphrase {
 function getPassphrase {
 	promptPassphrase
 	while [ "$PASS" != "$PASSCONF" ]; do
-		echo "Passphrases did not match, try again..."
+		echo "Les mots de passe ne correspondent pas, réessayez..."
 		promptPassphrase
 	done
 }
 
 if [[ $UID -ne 0 ]]; then
- echo "This script needs to be run as root (with sudo)."
+ echo "Ce script doit être exécuté en tant que root (avec sudo)."
  exit 1
 fi
 
-# Get the admin user.
+# Obtenez l'utilisateur admin.
 users=($(ls /home))
-echo "Existing users:"
+echo "Utilisateurs existants:"
 echo
 for index in ${!users[*]}
 do
@@ -40,52 +40,52 @@ do
 done
 echo
 
-while [ -z "$SELECTION" ]; do read -p "Please select the user you created during the Ubuntu installation: " SELECTION; done
+while [ -z "$SELECTION" ]; do read -p "Veuillez sélectionner l'utilisateur que vous avez créé lors de l'installation d'Ubuntu: " SELECTION; done
 ADMINUSER=${users[$SELECTION]}
 if [ -z "$ADMINUSER" ]; then
-	echo "Invalid user selected. Please run the script again."
+	echo "Utilisateur non valide sélectionné. Veuillez relancer le script."
 	exit
 fi
 
-# Get the username for the primary user.
+# Obtenez le nom d'utilisateur pour l'utilisateur principal.
 echo
-echo "Please enter a username for the primary device user that will be created by this script."
-while [ -z "$ENDUSER" ]; do read -p "Username for primary device user: " ENDUSER; done
+echo "Veuillez entrer un nom d'utilisateur pour l'utilisateur principal de l'appareil qui sera créé par ce script."
+while [ -z "$ENDUSER" ]; do read -p "Nom d'utilisateur pour l'utilisateur principal de l'appareil: " ENDUSER; done
 if [ -d "/home/$ENDUSER" ]; then
 	if [ "$ENDUSER" == "$ADMINUSER" ]; then
-		echo "Primary user cannot be the same as the admin user."
+		echo "L'utilisateur principal ne peut pas être le même que l'utilisateur admin."
 		exit
 	fi
 
-	read -p "The username you entered already exists. Do you want to continue? [y/n]: " CONFIRM
-	if [ "$CONFIRM" != "y" ]; then
+	read -p "Le nom d'utilisateur que vous avez saisi existe déjà. Voulez-vous continuer ? [o/n]: " CONFIRM
+	if [ "$CONFIRM" != "o" ]; then
 		exit
 	fi
 fi
 
-echo "If you are not using the default internet repositories you should configure this before running this script."
-echo "You should also have an active network connection to the repositories."
-read -p "Continue? [y/n]: " CONFIRM
-if [ "$CONFIRM" != "y" ]; then
+echo "Si vous n'utilisez pas les dépôts Internet par défaut, vous devez le configurer avant d'exécuter ce script."
+echo "Vous devez également disposer d'une connexion réseau active avec les dépôts."
+read -p "Continuer ? [o/n]: " CONFIRM
+if [ "$CONFIRM" != "o" ]; then
  exit
 fi
 
-echo -e "${HIGHLIGHT}Running system updates...${NC}"
-# Update.
+echo -e "${HIGHLIGHT}Mises à jour du système...${NC}"
+# Réactualiser.
 apt-get update
-# Upgrade.
+# Mise à jour.
 apt-get dist-upgrade -y
-# Remove packages.
+# Retirer les paquets.
 apt-get remove -y popularity-contest
-# And install required packages.
+# Et installer les paquets nécessaires.
 apt-get install -y apparmor-profiles apparmor-utils auditd 
 
-# Configuring mount and grub. We need to make sure the script is running for the first time.
-echo -e "${HIGHLIGHT}Configuring fstab...${NC}"
-read -p "Is this the first time you run the post-install script? [y/n]: " CONFIRM
-if [ "$CONFIRM" == "y" ]; then
-	# Update fstab.
-	echo -e "${HIGHLIGHT}Writing fstab config...${NC}"
+# Configuration du montage et de grub. Nous devons nous assurer que le script est lancé pour la première fois.
+echo -e "${HIGHLIGHT}Configuration du fstab...${NC}"
+read -p "Est-ce la première fois que vous exécutez le script de post-installation ? [o/n]: " CONFIRM
+if [ "$CONFIRM" == "o" ]; then
+	# Mise à jour du fstab.
+	echo -e "${HIGHLIGHT}Écriture de la configuration fstab...${NC}"
 	sed -ie '/\s\/home\s/ s/defaults/defaults,noexec,nosuid,nodev/' /etc/fstab
 	EXISTS=$(grep "/tmp/" /etc/fstab)
 	if [ -z "$EXISTS" ]; then
@@ -94,17 +94,17 @@ if [ "$CONFIRM" == "y" ]; then
 		sed -ie '/\s\/tmp\s/ s/defaults/defaults,noexec,nosuid,nodev/' /etc/fstab
 	fi
 	echo "none /run/shm tmpfs rw,noexec,nosuid,nodev 0 0" >> /etc/fstab
-	# Bind /var/tmp to /tmp to apply the same mount options during system boot
+	# Relier /var/tmp à /tmp pour appliquer les mêmes options de montage lors du démarrage du système
  	echo "/tmp /var/tmp none bind 0 0" >> /etc/fstab
-	# Temporarily make the /tmp directory executable before running apt-get and remove execution flag afterwards. This is because
-	# sometimes apt writes files into /tmp and executes them from there.
+	# Rendre temporairement le répertoire /tmp exécutable avant d'exécuter apt-get et supprimer le drapeau d'exécution 
+    # par la suite. En effet, apt écrit parfois des fichiers dans /tmp et les exécute à partir de là.
 	echo -e "DPkg::Pre-Invoke{\"mount -o remount,exec /tmp\";};\nDPkg::Post-Invoke {\"mount -o remount /tmp\";};" >> /etc/apt/apt.conf.d/99tmpexec
 	chmod 644 /etc/apt/apt.conf.d/99tmpexec
 fi
 
-# Set grub password.
-echo -e "${HIGHLIGHT}Configuring grub...${NC}"
-echo "Please enter a grub sysadmin passphrase..."
+# Définir le mot de passe de grub.
+echo -e "${HIGHLIGHT}Configuration de grub...${NC}"
+echo "Veuillez entrer un mot de passe sysadmin pour grub..."
 getPassphrase
 
 echo "set superusers=\"sysadmin\"" >> /etc/grub.d/40_custom
@@ -114,11 +114,11 @@ sed -ie '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"$/ module.sig_enforce=yes"/' /etc/def
 echo "GRUB_SAVEDEFAULT=false" >> /etc/default/grub
 update-grub
 
-# Set permissions for admin user's home directory.
+# Définir les autorisations pour le répertoire personnel de l'utilisateur admin.
 chmod 700 "/home/$ADMINUSER"
 
-# Configure automatic updates.
-echo -e "${HIGHLIGHT}Configuring automatic updates...${NC}"
+# Configurer les mises à jour automatiques.
+echo -e "${HIGHLIGHT}Configuration des mises à jour automatiques...${NC}"
 EXISTS=$(grep "APT::Periodic::Update-Package-Lists \"1\"" /etc/apt/apt.conf.d/20auto-upgrades)
 if [ -z "$EXISTS" ]; then
 	echo "APT::Periodic::Update-Package-Lists \"1\";" >> /etc/apt/apt.conf.d/20auto-upgrades
@@ -136,58 +136,58 @@ fi
 chmod 644 /etc/apt/apt.conf.d/20auto-upgrades
 chmod 644 /etc/apt/apt.conf.d/10periodic
 
-# Prevent standard user executing su.
-echo -e "${HIGHLIGHT}Configure su execution...${NC}"
+# Empêcher l'utilisateur standard d'exécuter su.
+echo -e "${HIGHLIGHT}Configure l'exécution de su...${NC}"
 dpkg-statoverride --update --add root adm 4750 /bin/su
 
-# Protect user home directories.
-echo -e "${HIGHLIGHT}Configuring home directories and shell access...${NC}"
+# Protéger les répertoires personnels des utilisateurs.
+echo -e "${HIGHLIGHT}Configuration des répertoires personnels et de l'accès au shell...${NC}"
 sed -ie '/^DIR_MODE=/ s/=[0-9]*\+/=0700/' /etc/adduser.conf
 sed -ie '/^UMASK\s\+/ s/022/077/' /etc/login.defs
 
-# Disable shell access for new users (not affecting the existing admin user).
+# Désactivez l'accès au shell pour les nouveaux utilisateurs (sans affecter l'utilisateur admin existant).
 sed -ie '/^SHELL=/ s/=.*\+/=\/usr\/sbin\/nologin/' /etc/default/useradd
 sed -ie '/^DSHELL=/ s/=.*\+/=\/usr\/sbin\/nologin/' /etc/adduser.conf
 
-# Installing libpam-pwquality 
-echo -e "${HIGHLIGHT}Configuring minimum password requirements...${NC}"
+# Installation de libpam-pwquality 
+echo -e "${HIGHLIGHT}Configuration des exigences minimales en matière de mot de passe...${NC}"
 apt-get install -f libpam-pwquality
 
-# Create the standard user.
+# Créer l'utilisateur standard.
 adduser "$ENDUSER"
 
-# Set some AppArmor profiles to enforce mode.
-echo -e "${HIGHLIGHT}Configuring apparmor...${NC}"
+# Définir quelques profils AppArmor en mode renforcé.
+echo -e "${HIGHLIGHT}Configuration de apparmor...${NC}"
 aa-enforce /etc/apparmor.d/usr.bin.firefox
 aa-enforce /etc/apparmor.d/usr.sbin.avahi-daemon
 aa-enforce /etc/apparmor.d/usr.sbin.dnsmasq
 aa-enforce /etc/apparmor.d/bin.ping
 aa-enforce /etc/apparmor.d/usr.sbin.rsyslogd
 
-# Setup auditing.
-echo -e "${HIGHLIGHT}Configuring system auditing...${NC}"
+# Mise en place de l'audit.
+echo -e "${HIGHLIGHT}Configuration de l'audit du système...${NC}"
 if [ ! -f /etc/audit/rules.d/tmp-monitor.rules ]; then
-echo "# Monitor changes and executions within /tmp
+echo "# Surveiller les changements et les exécutions au sein de /tmp
 -w /tmp/ -p wa -k tmp_write
 -w /tmp/ -p x -k tmp_exec" > /etc/audit/rules.d/tmp-monitor.rules
 fi
 
 if [ ! -f /etc/audit/rules.d/admin-home-watch.rules ]; then
-echo "# Monitor administrator access to /home directories
+echo "# Surveiller l'accès de l'administrateur aux répertoires /home
 -a always,exit -F dir=/home/ -F uid=0 -C auid!=obj_uid -k admin_home_user" > /etc/audit/rules.d/admin-home-watch.rules
 fi
 augenrules
 systemctl restart auditd.service
 
-# Configure the settings for the "Welcome" popup box on first login.
-echo -e "${HIGHLIGHT}Configuring user first login settings...${NC}"
+# Configurez les paramètres de la fenêtre contextuelle "Bienvenue" lors de la première connexion.
+echo -e "${HIGHLIGHT}Configuration des paramètres de la première connexion de l'utilisateur...${NC}"
 mkdir -p "/home/$ENDUSER/.config"
 echo yes > "/home/$ENDUSER/.config/gnome-initial-setup-done"
 chown -R "$ENDUSER:$ENDUSER" "/home/$ENDUSER/.config"
 sudo -H -u "$ENDUSER" ubuntu-report -f send no
 
-# Disable error reporting services
-echo -e "${HIGHLIGHT}Configuring error reporting...${NC}"
+# Désactiver les services de rapport des erreurs
+echo -e "${HIGHLIGHT}Configuration du signalement des erreurs...${NC}"
 systemctl stop apport.service
 systemctl disable apport.service
 systemctl mask apport.service
@@ -196,8 +196,8 @@ systemctl stop whoopsie.service
 systemctl disable whoopsie.service
 systemctl mask whoopsie.service
 
-# Lockdown Gnome screensaver lock settings
-echo -e "${HIGHLIGHT}Configuring Gnome screensaver lock settings...${NC}"
+# Paramètres de verrouillage de l'économiseur d'écran Gnome
+echo -e "${HIGHLIGHT}Configuration des paramètres de verrouillage de l'économiseur d'écran Gnome...${NC}"
 mkdir -p /etc/dconf/db/local.d/locks
 echo "[org/gnome/desktop/session]
 idle-delay=600
@@ -212,20 +212,20 @@ echo "/org/gnome/desktop/session/idle-delay
 
 dconf update
 
-# Disable apport (error reporting)
+# Désactiver apport (déclaration d'erreur)
 sed -ie '/^enabled=1$/ s/1/0/' /etc/default/apport
 sed -ie '/^enabled=1$/ s/1/0/' /etc/default/whoopsie
 
 sudo -H -u "$ENDUSER" dbus-launch gsettings set com.ubuntu.update-notifier show-apport-crashes false
 
-# Fix some permissions in /var that are writable and executable by the standard user.
-echo -e "${HIGHLIGHT}Configuring additional directory permissions...${NC}"
+# Correction de certaines permissions dans /var qui sont inscriptibles et exécutables par l'utilisateur standard.
+echo -e "${HIGHLIGHT}Configuration des autorisations de répertoire supplémentaires...${NC}"
 chmod o-w /var/crash
 chmod o-w /var/metrics
 chmod o-w /var/tmp
 
-# Turn off privacy-leaking aspects of Unity.
-echo -e "${HIGHLIGHT}Configuring privacy settings...${NC}"
+# Désactivez les aspects d'Unity qui portent atteinte à la vie privée.
+echo -e "${HIGHLIGHT}Configuration des paramètres de confidentialité...${NC}"
 EXISTS=$(grep "user-db:user" /etc/dconf/profile/user)
 if [ -z "$EXISTS" ]; then
 	echo "user-db:user" >> /etc/dconf/profile/user
@@ -237,14 +237,14 @@ if [ -z "$EXISTS" ]; then
 fi
 dconf update
 
-# Setting up firewall without any rules.
-echo -e "${HIGHLIGHT}Configuring firewall...${NC}"
+# Mise en place d'un pare-feu sans aucune règle.
+echo -e "${HIGHLIGHT}Configuration du pare-feu...${NC}"
 ufw enable
 
 echo
-echo -e "${HIGHLIGHT}Installation complete.${NC}"
+echo -e "${HIGHLIGHT}Installation terminée.${NC}"
 
-read -p "Reboot now? [y/n]: " CONFIRM
-if [ "$CONFIRM" == "y" ]; then
+read -p "Redémarrer maintenant ? [o/n]: " CONFIRM
+if [ "$CONFIRM" == "o" ]; then
 	reboot
 fi
