@@ -1,0 +1,23 @@
+From 4b7c12139ad1ee296975447432fe588d29902f02 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Lo=C3=AFc?= <4661917+HacKurx@users.noreply.github.com>
+Date: Fri, 15 Feb 2019 14:19:17 +0100
+Subject: [PATCH] Exec logging
+
+Provides a simple equivalence to GRKERNSEC_EXECLOG
+---
+ fs/exec.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/exec.c b/fs/exec.c
+index 8dedaa5ea9bf5..9cf0a88353f0f 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1815,6 +1815,8 @@ static int __do_execve_file(int fd, struct filename *filename,
+ 	if (retval < 0)
+ 		goto out;
+ 
++    printk(KERN_ERR "linux-hardened: exec of %s by uid/euid:%u/%u\n", filename->name, current_uid(), current_euid());
++
+ 	would_dump(bprm, bprm->file);
+ 
+ 	retval = exec_binprm(bprm);
