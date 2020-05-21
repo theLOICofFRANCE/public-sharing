@@ -1,6 +1,6 @@
 #!/bin/bash
 # Script for maintain a modified linux branch.
-# Version 0.0.1
+# Version 0.0.2
 # Under licence GPL v2, developed by HacKurx.
 
 # Make sure you work in the linux tree
@@ -24,6 +24,9 @@ cut -d/ -f7 /tmp/get.txt > /tmp/all-patch.txt
 # obtain commits from the upstream branch
 git remote add stable-4.19.y -t linux-4.19.y git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
 git remote update stable-4.19.y
+
+# Create a local branch. This makes it easy to use git diff to compare branches.
+git checkout -b v$kversion
 
 # Apply the patches whose dry-run went well
 for i in $(cat /tmp/all-patch.txt); do 
