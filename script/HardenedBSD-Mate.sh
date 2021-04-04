@@ -98,6 +98,7 @@ service microcode_update enable
 service microcode_update start
 
 # Activer l'autostart de networkmgr
+mkdir -p '/home/loic/.config/autostart/'
 cat > /home/loic/.config/autostart/networkmgr.desktop  <<EOF
 [Desktop Entry]
 Type=Application
@@ -110,7 +111,7 @@ Comment[fr_FR]=networkmgr
 Comment=networkmgr
 X-MATE-Autostart-Delay=1
 EOF
-chown loic:loic '/home/loic/.config/autostart/networkmgr.desktop'
+chown -R loic:loic '/home/loic/.config/autostart/'
 chmod 644 '/home/loic/.config/autostart/networkmgr.desktop'
 
 # Utiliser NTPdate pour synchroniser l'heure au démarrage sans utiliser le daemon NTP
