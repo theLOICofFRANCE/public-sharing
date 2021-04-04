@@ -5,13 +5,15 @@ pkg update -f
 pkg install -fy mate xinit xorg xdg-user-dirs slim slim-themes
 
 # Permettre le démarrage de Mate
-cat > /home/loic/.xinitrc <<EOF
+cat > /home/loic/.profile <<EOF
 export LANG="fr_FR.UTF-8"
 export LC_ALL="fr_FR.UTF-8"
 export LC_MESSAGES="fr_FR.UTF-8"
-exec mate-session
+export LC_CTYPE="fr_FR.UTF-8"
+export LC_COLLATE="fr_FR.UTF-8"
 EOF
-chown loic:loic /home/loic/.xinitrc
+echo "exec mate-session" > /home/loic/.xinitrc
+chown loic:loic /home/loic/.xinitrc /home/loic/.profile
 
 # Personnaliser SLIM
 sed -i -r 's/.*current_theme.*/current_theme rainbow/g' /usr/local/etc/slim.conf
