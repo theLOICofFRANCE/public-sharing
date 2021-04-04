@@ -1,9 +1,9 @@
 #!/bin/sh
 
-# Installer Mate
-pkg install mate xinit xorg nano wget
+# Installer le bureau Mate
+pkg install -fy mate xinit xorg nano wget
 
-# Permettre son démarrage
+# Permettre le démarrage de Mate
 pw groupmod wheel -m loic
 cat > /home/loic/.xinitrc <<EOF
 export LANG="fr_FR.UTF-8"
@@ -13,8 +13,11 @@ exec mate-session
 EOF
 chown loic:loic /home/loic/.xinitrc
 
-# Installer les logiciels
-pkg install firefox vlc gimp cups system-config-printer xdg-user-dirs zip unzip gnumeric abiword sylpheed octopkg sudo meld wifimgr seahorse
+# Installer les logiciels les plus utilisés
+pkg install -fy firefox vlc gimp cups system-config-printer xdg-user-dirs zip unzip gnumeric abiword sylpheed octopkg sudo meld wifimgr seahorse gvfs bash
+
+# Utiliser bash sur le profil utilisateur
+chsh -s /usr/local/bin/bash loic
 
 #Configuration pour wifimgr (à comparer avec networkmgr)
 cat >>/etc/rc.conf <<EOF
@@ -25,7 +28,7 @@ EOF
 # Autoriser loic à utiliser sudo (pour octopkg)
 echo "loic ALL=(ALL) ALL" >> /usr/local/etc/sudoers
 
-# Désactiver MPROTECT
+# Désactiver MPROTECT pour Firefox
 hbsdcontrol pax disable mprotect /usr/local/lib/firefox/firefox
 hbsdcontrol pax disable mprotect /usr/local/lib/firefox/plugin-container
 
@@ -52,9 +55,9 @@ echo "defaultclass = french" >> /etc/adduser.conf
 # Permettre aux utilisateurs de monter des périphériques
 echo "vfs.usermount=1" >> /etc/sysctl.conf
 
-# Permettre le montage automatique des clés USB sous Mate
-service dbus enable
+# Activer les services pour le bureau Mate
+sysrc moused_enable=yes dbus_enable=yes hald_enable=yes slim_enable=yes
 
 # Installer le fork de mate-tweak
 wget http://pkg.fr.ghostbsd.org/stable/FreeBSD:12:amd64/latest/All/station-tweak-0.7.txz
-pkg install station-tweak-0.7.txz
+pkg install -fy station-tweak-0.7.txz
