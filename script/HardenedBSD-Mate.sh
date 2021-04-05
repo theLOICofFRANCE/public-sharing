@@ -1,5 +1,11 @@
 #!/bin/sh
 
+# Seul l'utilisateur root peut exécuter le script
+if [ $(id -u) -ne 0 ]; then
+	echo "Le script doit être exécuté en tant que root !"
+	exit 1
+fi
+
 # Installer le bureau Mate
 pkg update -f
 pkg install -fy mate xinit xorg xdg-user-dirs slim slim-themes
@@ -79,17 +85,17 @@ EOF
 
 echo "defaultclass = french" >> /etc/adduser.conf
 
-# Permettre aux utilisateurs de monter des périphériques
-echo "vfs.usermount=1" >> /etc/sysctl.conf
-
 # Activer les services pour le bureau Mate
 sysrc moused_enable=yes dbus_enable=yes hald_enable=yes slim_enable=yes
 
 # Personnaliser les autres services
 sysrc sendmail_enable=none clear_tmp_enable=yes background_dhclient=yes ipv6_privacy=yes
 
-# Optimiser le scheduler pour un usage desktop
-sysrc -f /etc/sysctl.conf kern.sched.preempt_thresh=224
+# Optimiser le système pour un usage desktop
+setconfig -f /etc/sysctl.conf kern.sched.preempt_thresh=224
+setconfig -f /etc/sysctl.conf kern.ipc.shmmax=67108864
+setconfig -f /etc/sysctl.conf kern.ipc.shmall=32768
+setconfig -f /etc/sysctl.conf vfs.usermount=1
 
 # Diminuer le timeout du menu du boot loader
 sysrc -f /boot/loader.conf autoboot_delay=3
@@ -136,7 +142,9 @@ sysrc ntpd_sync_on_start=no
 sysrc ntpdate_enable=yes
 
 # procfs pour l'environnement de bureau MATE
-echo "proc            /proc           procfs  rw      0       0" >> /etc/fstab
+if [ $(grep -q "/proc" "${FSTAB}"; echo $?) == 1 ]; then
+	echo "proc            /proc           procfs  rw      0       0" >> /etc/fstab
+fi
 
 # Installer le fork de mate-tweak
 wget https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
