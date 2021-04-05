@@ -76,6 +76,9 @@ french|French Users Accounts:\
        :tc=default:
 EOF
 
+setconfig -f /etc/profile LANG="fr_FR.UTF-8"
+setconfig -f /etc/profile CHARSET="UTF-8"
+
 cat > /usr/local/etc/X11/xorg.conf.d/10-keyboard.conf <<EOF
 Section "InputClass"
         Identifier "Keyboard Defauls"
