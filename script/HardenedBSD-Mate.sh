@@ -89,7 +89,8 @@ echo "defaultclass = french" >> /etc/adduser.conf
 sysrc moused_enable=yes dbus_enable=yes hald_enable=yes slim_enable=yes
 
 # Personnaliser les autres services
-sysrc sendmail_enable=none clear_tmp_enable=yes background_dhclient=yes ipv6_privacy=yes
+# Activer "ipv6_privacy=yes" si IPV6 est utilisé
+sysrc sendmail_enable=none clear_tmp_enable=yes background_dhclient=yes ipv6_network_interfaces="none" ipv6_enable=no
 
 # Optimiser le système pour un usage desktop
 setconfig -f /etc/sysctl.conf kern.sched.preempt_thresh=224
