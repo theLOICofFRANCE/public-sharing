@@ -11,18 +11,18 @@ pkg update -f
 pkg install -fy mate xinit xorg xdg-user-dirs slim slim-themes
 
 # Permettre le démarrage de Mate
-cat > /home/loic/.profile <<EOF
+cat > /home/loic/.xinitrc <<EOF
 export LANG="fr_FR.UTF-8"
 export LC_ALL="fr_FR.UTF-8"
 export LC_MESSAGES="fr_FR.UTF-8"
 export LC_CTYPE="fr_FR.UTF-8"
 export LC_COLLATE="fr_FR.UTF-8"
+exec mate-session
 EOF
-echo "exec mate-session" > /home/loic/.xinitrc
-chown loic:loic /home/loic/.xinitrc /home/loic/.profile
+chown loic:loic /home/loic/.xinitrc
 
 # Personnaliser SLIM
-wget https://github.com/HacKurx/public-sharing/raw/master/files/slim-hardenedbsd.tar.bz2
+wget -c https://github.com/HacKurx/public-sharing/raw/master/files/slim-hardenedbsd.tar.bz2
 tar jxvf slim-hardenedbsd.tar.bz2
 mv hardenedbsd/ /usr/local/share/slim/themes/hardenedbsd
 sed -i -r 's/.*current_theme.*/current_theme hardenedbsd/g' /usr/local/etc/slim.conf
@@ -30,9 +30,9 @@ sed -i -r 's/.*simone.*/default_user loic/g' /usr/local/etc/slim.conf
 
 # Télécharger quelques fonds d'écran
 mkdir -p /usr/local/share/backgrounds/hardenedbsd
-wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue1.png
-wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue2.png
-wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
+wget -c -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue1.png
+wget -c -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue2.png
+wget -c -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
 cp '/usr/local/share/backgrounds/mate/desktop/Stripes.png' '/usr/local/share/backgrounds/mate/desktop/Stripes.orig'
 cp '/usr/local/share/backgrounds/hardenedbsd/HardenedBSB-DarkBlue1.png' '/usr/local/share/backgrounds/mate/desktop/Stripes.png'
 
@@ -92,7 +92,7 @@ sysrc moused_enable=yes dbus_enable=yes hald_enable=yes slim_enable=yes
 
 # Personnaliser les autres services
 # Activer "ipv6_privacy=yes" si IPV6 est utilisé
-sysrc sendmail_enable=none clear_tmp_enable=yes background_dhclient=yes ipv6_network_interfaces="none" ipv6_enable=no
+sysrc sendmail_enable=none clear_tmp_enable=yes background_dhclient=yes ipv6_network_interfaces=none
 
 # Optimiser le système pour un usage desktop
 setconfig -f /etc/sysctl.conf kern.sched.preempt_thresh=224
@@ -137,7 +137,7 @@ Comment[fr_FR]=networkmgr
 Comment=networkmgr
 X-MATE-Autostart-Delay=1
 EOF
-chown -R loic:loic '/home/loic/.config/autostart/'
+chown -R loic:loic '/home/loic/.config/'
 chmod 644 '/home/loic/.config/autostart/networkmgr.desktop'
 
 # Utiliser NTPdate pour synchroniser l'heure au démarrage sans utiliser le daemon NTP
@@ -145,10 +145,13 @@ sysrc ntpd_sync_on_start=no
 sysrc ntpdate_enable=yes
 
 # procfs pour l'environnement de bureau MATE
-if [ $(grep -q "/proc" "${FSTAB}"; echo $?) == 1 ]; then
+if [ $(grep -q "/proc" "/etc/fstab"; echo $?) == 1 ]; then
 	echo "proc            /proc           procfs  rw      0       0" >> /etc/fstab
 fi
 
 # Installer le fork de mate-tweak
-wget https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
+wget -c https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
 pkg install -fy station-tweak-0.7.txz
+
+# Redémarrage
+reboot
