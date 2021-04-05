@@ -16,8 +16,17 @@ echo "exec mate-session" > /home/loic/.xinitrc
 chown loic:loic /home/loic/.xinitrc /home/loic/.profile
 
 # Personnaliser SLIM
-sed -i -r 's/.*current_theme.*/current_theme rainbow/g' /usr/local/etc/slim.conf
+wget https://github.com/HacKurx/public-sharing/raw/master/files/slim-hardenedbsd.tar.bz2
+tar jxvf slim-hardenedbsd.tar.bz2
+mv hardenedbsd/ /usr/local/share/slim/themes/hardenedbsd
+sed -i -r 's/.*current_theme.*/current_theme hardenedbsd/g' /usr/local/etc/slim.conf
 sed -i -r 's/.*simone.*/default_user loic/g' /usr/local/etc/slim.conf
+
+# Télécharger quelques fonds d'écran
+mkdir -p /usr/local/share/backgrounds/hardenedbsd
+wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue1.png
+wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue2.png
+wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
 
 # Permettre à Loic de lancer su, d'éteindre la machine et d'accéder au DRI
 pw groupmod wheel -m loic
