@@ -103,10 +103,16 @@ sysrc firewall_quiet=yes
 sysrc firewall_logdeny=yes
 service ipfw start
 
-# Mise à jour du microcode CPU
-pkg install -fy devcpu-data
-service microcode_update enable
-service microcode_update start
+# Installer les Additions invité VirtualBox ou sinon les microcodes du CPU
+if [ $(pciconf -lv | grep -i virtualbox >/dev/null 2>/dev/null; echo $?) = "0" ]; then
+	pkg install -fy virtualbox-ose-additions
+	sysrc vboxguest_enable=yes vboxservice_enable=yes
+	sysrc moused_enable=no
+else
+       pkg install -fy devcpu-data
+       service microcode_update enable
+       service microcode_update start
+fi
 
 # Activer l'autostart de networkmgr
 mkdir -p '/home/loic/.config/autostart/'
