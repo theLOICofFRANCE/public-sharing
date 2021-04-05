@@ -124,5 +124,5 @@ sysrc ntpdate_enable=yes
 echo "proc            /proc           procfs  rw      0       0" >> /etc/fstab
 
 # Installer le fork de mate-tweak
-wget http://pkg.fr.ghostbsd.org/stable/FreeBSD:12:amd64/latest/All/station-tweak-0.7.txz
+wget https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
 pkg install -fy station-tweak-0.7.txz
