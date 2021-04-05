@@ -33,6 +33,8 @@ mkdir -p /usr/local/share/backgrounds/hardenedbsd
 wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue1.png
 wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue2.png
 wget -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
+cp '/usr/local/share/backgrounds/mate/desktop/Stripes.png' '/usr/local/share/backgrounds/mate/desktop/Stripes.orig'
+cp '/usr/local/share/backgrounds/hardenedbsd/HardenedBSB-DarkBlue1.png' '/usr/local/share/backgrounds/mate/desktop/Stripes.png'
 
 # Permettre à Loic de lancer su, d'éteindre la machine et d'accéder au DRI
 pw groupmod wheel -m loic
