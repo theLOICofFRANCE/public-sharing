@@ -1,65 +1,109 @@
 #!/bin/sh
+# Version 20210414 / BSD-2-Clause
+# Copyright (c) 2021, HacKurx
+# All rights reserved.
 
 # Seul l'utilisateur root peut exécuter le script
-if [ $(id -u) -ne 0 ]; then
-	echo "Le script doit être exécuté en tant que root !"
+if [ "$(id -u)" -ne "0" ]; then
+	echo "Le script doit être exécuté en tant que root !" 1>&2
 	exit 1
 fi
 
+# Création des variables
+ALPHA2MIN=$(grep "^keymap=" '/etc/rc.conf' | cut -d\" -f2 | cut -d\. -f1)
+ALPHA2MAJ=$(echo $ALPHA2MIN | tr '[a-z]' '[A-Z]')
+LANGUEUTF8=$(echo "$ALPHA2MIN"_"$ALPHA2MAJ".UTF-8)
+UTILISATEUR=$(grep 1001 /etc/group | cut -d: -f1)
+
+# Test de la présence d'un utilisateur avec un UID de 1001
+if grep -q '1001' /etc/group 1>&2 ; then
+	echo "Installation du bureau Mate et personnalisation du système pour $UTILISATEUR."
+else
+	echo "Création d'un utilisateur avec un UID de 1001"
+	adduser -u 1001
+fi
+
+# Confirmer la proposition de la langue pour les locales UTF-8
+read -p "Activer la locale $LANGUEUTF8 ? [O/n] " REPVAR
+if [ "$REPVAR" = "N" ] || [ "$REPVAR" = "n" ] ; then
+        echo -n "Entrer le nom de la locale UTF-8 à utiliser: "
+        read LANGUEUTF8
+        read -p "Utiliser la locale $LANGUEUTF8 ? [O/n] " REPVAR2
+        if [ "$REPVAR2" = "N" ] || [ "$REPVAR2" = "n" ] ; then
+			echo "Je reviendrai..."
+			exit 0
+        fi
+        echo "$LANGUEUTF8 sera utilisé."
+else
+        echo "$LANGUEUTF8 sera utilisé."
+fi
+
+# MàJ verbeuse et suppression interactive des fichiers obsolètes
+hbsd-update -C
+
+read -p "Faire la mise à jour du système de base de HardenedBSD ? [N/o] " REPVAR3
+if [ "$REPVAR3" = "O" ] || [ "$REPVAR3" = "o" ] ; then
+	hbsd-update -V -K ancienHBSD
+fi
+
 # Installer le bureau Mate
-pkg update -f
+env ASSUME_ALWAYS_YES=YES pkg bootstrap
 pkg install -fy mate xinit xorg xdg-user-dirs slim slim-themes
 
 # Permettre le démarrage de Mate
-cat > /home/loic/.xinitrc <<EOF
-export LANG="fr_FR.UTF-8"
-export LC_ALL="fr_FR.UTF-8"
-export LC_MESSAGES="fr_FR.UTF-8"
-export LC_CTYPE="fr_FR.UTF-8"
-export LC_COLLATE="fr_FR.UTF-8"
+cat > /home/$UTILISATEUR/.xinitrc <<EOF
+export LANG="$LANGUEUTF8"
+export LC_ALL="$LANGUEUTF8"
+export LC_MESSAGES="$LANGUEUTF8"
+export LC_CTYPE="$LANGUEUTF8"
+export LC_COLLATE="$LANGUEUTF8"
 exec mate-session
 EOF
-chown loic:loic /home/loic/.xinitrc
+chown $UTILISATEUR:$UTILISATEUR /home/$UTILISATEUR/.xinitrc
 
 # Personnaliser SLIM
-wget -c https://github.com/HacKurx/public-sharing/raw/master/files/slim-hardenedbsd.tar.bz2
+fetch https://github.com/HacKurx/public-sharing/raw/master/files/slim-hardenedbsd.tar.bz2
 tar jxvf slim-hardenedbsd.tar.bz2
 mv hardenedbsd/ /usr/local/share/slim/themes/hardenedbsd
-sed -i -r 's/.*current_theme.*/current_theme hardenedbsd/g' /usr/local/etc/slim.conf
-sed -i -r 's/.*simone.*/default_user loic/g' /usr/local/etc/slim.conf
+sed -i -r "s/.*current_theme.*/current_theme hardenedbsd/g" /usr/local/etc/slim.conf
+sed -i -r "s/.*simone.*/default_user $UTILISATEUR/g" /usr/local/etc/slim.conf
 
 # Télécharger quelques fonds d'écran
 mkdir -p /usr/local/share/backgrounds/hardenedbsd
-wget -c -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue1.png
-wget -c -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue2.png
-wget -c -P /usr/local/share/backgrounds/hardenedbsd https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
-cp '/usr/local/share/backgrounds/mate/desktop/Stripes.png' '/usr/local/share/backgrounds/mate/desktop/Stripes.orig'
-cp '/usr/local/share/backgrounds/hardenedbsd/HardenedBSB-DarkBlue1.png' '/usr/local/share/backgrounds/mate/desktop/Stripes.png'
+fetch -o /usr/local/share/backgrounds/hardenedbsd/HardenedBSD-DarkBlue1.png https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue1.png
+fetch -o /usr/local/share/backgrounds/hardenedbsd/HardenedBSD-DarkBlue2.png https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSB-DarkBlue2.png
+fetch -o /usr/local/share/backgrounds/hardenedbsd/HardenedBSD-BlueSun.jpg https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
+sed -i -r "s/3C8F25/0B324A/g" /usr/local/share/glib-2.0/schemas/org.mate.background.gschema.xml
 
-# Permettre à Loic de lancer su, d'éteindre la machine et d'accéder au DRI
-pw groupmod wheel -m loic
-pw groupmod operator -m loic
-pw groupmod video -m loic
+# Permettre à $UTILISATEUR de lancer su, d'éteindre la machine et d'accéder au DRI
+pw groupmod wheel -m $UTILISATEUR
+pw groupmod operator -m $UTILISATEUR
+pw groupmod video -m $UTILISATEUR
 
-# Autoriser loic à utiliser sudo (exemple pour octopkg)
-echo "loic ALL=(ALL) ALL" >> /usr/local/etc/sudoers
+# Autoriser $UTILISATEUR à utiliser sudo (exemple pour octopkg)
+echo "$UTILISATEUR ALL=(ALL) ALL" >> /usr/local/etc/sudoers
 
 # Installer les logiciels les plus utilisés
-pkg install -fy firefox vlc gimp cups cups-filters system-config-printer gnumeric abiword claws-mail claws-mail-pgp meld octopkg
-pw groupmod cups -m loic
+pkg install -fy firefox vlc gimp cups cups-filters system-config-printer gnumeric abiword claws-mail claws-mail-pgp meld octopkg keepassxc
+pw groupmod cups -m $UTILISATEUR
 
 # Installer les utilitaires les plus utilisés
-pkg install -fy zip unzip unrar p7zip sudo networkmgr seahorse gvfs bash nano wget sysinfo hardening-check automount
+pkg install -fy zip unzip unrar p7zip sudo networkmgr seahorse gvfs bash fish nano wget sysinfo hardening-check automount
 cp /usr/local/etc/automount.conf.sample /usr/local/etc/automount.conf
 
-# Utiliser bash sur le profil utilisateur
-chsh -s /usr/local/bin/bash loic
+# Utiliser fish sur le profil utilisateur
+chsh -s /usr/local/bin/bash $UTILISATEUR
 
 # Configuration pour le wifi (à comparer avec networkmgr)
-# wpa_passphrase "LAN" "123456" > /etc/wpa_supplicant.conf
-cat >>/etc/rc.conf <<EOF
-wlans_ath0=wlan0
-ifconfig_wlan0="WPA SYNCDHCP"
+#wpa_passphrase "LAN" "Azertyui" > /etc/wpa_supplicant.conf
+sysrc wlans_ath0="wlan0"
+sysrc ifconfig_wlan0="WPA SYNCDHCP"
+
+cat >/etc/wpa_supplicant.conf <<EOF
+network={
+        ssid="LAN"
+        psk=c92487af1618e5b7063807302ee26bfb7fdd98d87fd0d9a6f6466c9a704c05a8
+}
 EOF
 
 # Désactiver MPROTECT pour Firefox
@@ -72,17 +116,17 @@ cat >>/etc/login.conf <<EOF
 
 french|French Users Accounts:\
        :charset=UTF-8:\
-       :lang=fr_FR.UTF-8:\
+       :lang=$LANGUEUTF8:\
        :tc=default:
 EOF
 
-setconfig -f /etc/profile LANG="fr_FR.UTF-8"
+setconfig -f /etc/profile LANG="$LANGUEUTF8"
 setconfig -f /etc/profile CHARSET="UTF-8"
 
 cat > /usr/local/etc/X11/xorg.conf.d/10-keyboard.conf <<EOF
 Section "InputClass"
         Identifier "Keyboard Defauls"
-        Driver "keyboard"
+        #Driver "keyboard"
         MatchIsKeyboard "on"
         Option "XkbLayout" "fr"
 EndSection
@@ -115,20 +159,9 @@ sysrc firewall_quiet=yes
 sysrc firewall_logdeny=yes
 service ipfw start
 
-# Installer les Additions invité VirtualBox ou sinon les microcodes du CPU
-if [ $(pciconf -lv | grep -i virtualbox >/dev/null 2>/dev/null; echo $?) = "0" ]; then
-	pkg install -fy virtualbox-ose-additions
-	sysrc vboxguest_enable=yes vboxservice_enable=yes
-	sysrc moused_enable=no
-else
-       pkg install -fy devcpu-data
-       service microcode_update enable
-       service microcode_update start
-fi
-
 # Activer l'autostart de networkmgr
-mkdir -p '/home/loic/.config/autostart/'
-cat > /home/loic/.config/autostart/networkmgr.desktop  <<EOF
+mkdir -p "/home/$UTILISATEUR/.config/autostart/"
+cat > /home/$UTILISATEUR/.config/autostart/networkmgr.desktop  <<EOF
 [Desktop Entry]
 Type=Application
 Exec=networkmgr
@@ -140,8 +173,8 @@ Comment[fr_FR]=networkmgr
 Comment=networkmgr
 X-MATE-Autostart-Delay=1
 EOF
-chown -R loic:loic '/home/loic/.config/'
-chmod 644 '/home/loic/.config/autostart/networkmgr.desktop'
+chown -R $UTILISATEUR:$UTILISATEUR "/home/$UTILISATEUR/.config/"
+chmod 644 "/home/$UTILISATEUR/.config/autostart/networkmgr.desktop"
 
 # Utiliser NTPdate pour synchroniser l'heure au démarrage sans utiliser le daemon NTP
 sysrc ntpd_sync_on_start=no
@@ -153,8 +186,47 @@ if [ $(grep -q "/proc" "/etc/fstab"; echo $?) == 1 ]; then
 fi
 
 # Installer le fork de mate-tweak
-wget -c https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
+fetch https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
 pkg install -fy station-tweak-0.7.txz
+
+# Installer les ports
+if [ ! -d "/usr/ports" ]; then
+    pkg install -fy git-lite
+    git clone --depth=1 https://github.com/HardenedBSD/hardenedbsd-ports.git /usr/ports
+fi
+
+# Spécifique à HardenedBSD
+pkg install -fy secadm secadm-kmod
+
+FHOSTS=$(sha256 /etc/hosts | awk '{print $4}')
+
+cat > /usr/local/etc/secadm.rules <<EOF
+secadm {
+  integriforce {
+    path: "/etc/hosts",
+    hash: "$FHOSTS",
+    type: "sha256",
+    mode: "hard",
+  }
+}
+EOF
+
+# Attente correction du Bug n°38 pour activation
+sysrc secadm_enable=NO
+#/usr/local/etc/rc.d/secadm start
+#echo ERREUR-SECADM >> "/etc/hosts"
+#grep SECADM /var/log/messages /etc/hosts
+
+# Installer les Additions invité VirtualBox ou sinon les microcodes du CPU
+if [ $(pciconf -lv | grep -i virtualbox 1>&2 ; echo $?) = "0" ]; then
+	pkg install -fy virtualbox-ose-additions
+	sysrc vboxguest_enable=yes vboxservice_enable=yes
+	sysrc moused_enable=no
+else
+       pkg install -fy devcpu-data drm-kmod
+       service microcode_update enable
+       service microcode_update start
+fi
 
 # Redémarrage
 reboot
