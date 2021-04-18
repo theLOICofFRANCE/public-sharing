@@ -1,5 +1,5 @@
 #!/bin/sh
-# Version 20210414 / BSD-2-Clause
+# Version 20210418 / BSD-2-Clause
 # Copyright (c) 2021, HacKurx
 # All rights reserved.
 
@@ -8,6 +8,25 @@ if [ "$(id -u)" -ne "0" ]; then
 	echo "Le script doit être exécuté en tant que root !" 1>&2
 	exit 1
 fi
+
+# Introduction
+echo
+echo "\033[1;34;40mBienvenue dans le programme d'installation de HardenedBSD-Mate.\033[0m"
+echo
+
+while :; do
+	read -p '(I)nstallation, (L)icence ou (S)ortir ? ' RINTRO
+
+	case $RINTRO in
+	[iI]*)	break;;
+	[lL]*)	echo "\nScript sous licence BSD à deux clauses.\n" && RINTRO="";;
+	[sS]*)	exit;;
+	esac
+done
+
+cat <<__EOT
+Début de l'installation...
+__EOT
 
 # Création des variables
 ALPHA2MIN=$(grep "^keymap=" '/etc/rc.conf' | cut -d\" -f2 | cut -d\. -f1)
@@ -38,12 +57,12 @@ else
         echo "$LANGUEUTF8 sera utilisé."
 fi
 
-# MàJ verbeuse et suppression interactive des fichiers obsolètes
-hbsd-update -C
+# MàJ verbeuse avec sauvegarde de l'ancien noyau
+test -f /usr/sbin/hbsd-update && hbsd-update -C
 
 read -p "Faire la mise à jour du système de base de HardenedBSD ? [N/o] " REPVAR3
 if [ "$REPVAR3" = "O" ] || [ "$REPVAR3" = "o" ] ; then
-	hbsd-update -V -K ancienHBSD
+	test -f /usr/sbin/hbsd-update && hbsd-update -V -K ancienHBSD
 fi
 
 # Installer le bureau Mate
@@ -75,12 +94,12 @@ fetch -o /usr/local/share/backgrounds/hardenedbsd/HardenedBSD-DarkBlue2.png http
 fetch -o /usr/local/share/backgrounds/hardenedbsd/HardenedBSD-BlueSun.jpg https://github.com/HacKurx/public-sharing/raw/master/files/HardenedBSD-BlueSun.jpg
 sed -i -r "s/3C8F25/0B324A/g" /usr/local/share/glib-2.0/schemas/org.mate.background.gschema.xml
 
-# Permettre à $UTILISATEUR de lancer su, d'éteindre la machine et d'accéder au DRI
+# Permettre à l'utilisateur de lancer su, d'éteindre la machine et d'accéder au DRI
 pw groupmod wheel -m $UTILISATEUR
 pw groupmod operator -m $UTILISATEUR
 pw groupmod video -m $UTILISATEUR
 
-# Autoriser $UTILISATEUR à utiliser sudo (exemple pour octopkg)
+# Autoriser l'utilisateur à utiliser sudo (exemple pour octopkg)
 echo "$UTILISATEUR ALL=(ALL) ALL" >> /usr/local/etc/sudoers
 
 # Installer les logiciels les plus utilisés
@@ -91,7 +110,7 @@ pw groupmod cups -m $UTILISATEUR
 pkg install -fy zip unzip unrar p7zip sudo networkmgr seahorse gvfs bash fish nano wget sysinfo hardening-check automount
 cp /usr/local/etc/automount.conf.sample /usr/local/etc/automount.conf
 
-# Utiliser fish sur le profil utilisateur
+# Utiliser bash sur le profil utilisateur
 chsh -s /usr/local/bin/bash $UTILISATEUR
 
 # Configuration pour le wifi (à comparer avec networkmgr)
