@@ -1,5 +1,5 @@
 #!/bin/sh
-# Version 20210418 / BSD-2-Clause
+# Version 20210419 / BSD-2-Clause
 # Copyright (c) 2021, HacKurx
 # All rights reserved.
 
@@ -11,7 +11,7 @@ fi
 
 # Introduction
 echo
-echo "\033[1;34;40mBienvenue dans le programme d'installation de HardenedBSD-Mate.\033[0m"
+echo -e "\033[1;34;40mBienvenue dans le programme d'installation de HardenedBSD-Mate.\033[0m"
 echo
 
 while :; do
@@ -19,7 +19,7 @@ while :; do
 
 	case $RINTRO in
 	[iI]*)	break;;
-	[lL]*)	echo "\nScript sous licence BSD à deux clauses.\n" && RINTRO="";;
+	[lL]*)	echo -e "\nScript sous licence BSD à deux clauses.\n" && RINTRO="";;
 	[sS]*)	exit;;
 	esac
 done
@@ -36,9 +36,9 @@ UTILISATEUR=$(grep 1001 /etc/group | cut -d: -f1)
 
 # Test de la présence d'un utilisateur avec un UID de 1001
 if grep -q '1001' /etc/group 1>&2 ; then
-	echo "Installation du bureau Mate et personnalisation du système pour $UTILISATEUR."
+	echo -e "\nPersonnalisation du système pour $UTILISATEUR."
 else
-	echo "Création d'un utilisateur avec un UID de 1001"
+	echo -e "\nCréation d'un utilisateur avec un UID de 1001."
 	adduser -u 1001
 fi
 
