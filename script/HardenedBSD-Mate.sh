@@ -1,5 +1,5 @@
 #!/bin/sh
-# Version 20210419 / BSD-2-Clause
+# Version 20210508 / BSD-2-Clause
 # Copyright (c) 2021, HacKurx
 # All rights reserved.
 
@@ -67,7 +67,9 @@ fi
 
 # Installer le bureau Mate
 env ASSUME_ALWAYS_YES=YES pkg bootstrap
-pkg install -fy mate xinit xorg xdg-user-dirs slim slim-themes
+pkg install -fy xinit xdg-user-dirs slim slim-themes
+pkg install -y xorg || pkg install -y xorg-server xorg-drivers xorg-fonts
+pkg install -y mate station-tweak || pkg install -y mate-desktop station-tweak
 
 # Permettre le démarrage de Mate
 cat > /home/$UTILISATEUR/.xinitrc <<EOF
@@ -103,11 +105,27 @@ pw groupmod video -m $UTILISATEUR
 echo "$UTILISATEUR ALL=(ALL) ALL" >> /usr/local/etc/sudoers
 
 # Installer les logiciels les plus utilisés
-pkg install -fy firefox vlc gimp cups cups-filters system-config-printer gnumeric abiword claws-mail claws-mail-pgp meld octopkg keepassxc
+pkg install -fy gimp cups cups-filters system-config-printer 
+pkg install -fy gnumeric abiword 
+pkg install -fy meld octopkg keepassxc
 pw groupmod cups -m $UTILISATEUR
 
+# Installer un navigateur par ordre de priorité et de disponibilité
+pkg install -y firefox || pkg install -y firefox-esr || pkg install -y chromium
+
+# Installer un lecteur multimédia par ordre de priorité et de disponibilité
+pkg install -y vlc || pkg install -y smplayer
+
+# Installer un client de messagerie par ordre de priorité et de disponibilité
+pkg install -y claws-mail claws-mail-pgp || pkg install -y sylpheed || pkg install -y thunderbird
+
 # Installer les utilitaires les plus utilisés
-pkg install -fy zip unzip unrar p7zip sudo networkmgr seahorse gvfs bash fish nano wget sysinfo hardening-check automount
+# A rajouter dans ~/.profile
+# [[ $PS1 && -f /usr/local/share/bash-completion/bash_completion.sh ]] && source /usr/local/share/bash-completion/bash_completion.sh
+pkg install -fy zip unzip unrar p7zip 
+pkg install -fy sudo networkmgr seahorse gvfs 
+pkg install -fy bash bash-completion fish nano 
+pkg install -fy wget sysinfo hardening-check automount
 cp /usr/local/etc/automount.conf.sample /usr/local/etc/automount.conf
 
 # Utiliser bash sur le profil utilisateur
@@ -139,8 +157,8 @@ french|French Users Accounts:\
        :tc=default:
 EOF
 
-setconfig -f /etc/profile LANG="$LANGUEUTF8"
-setconfig -f /etc/profile CHARSET="UTF-8"
+sysrc -f /etc/profile LANG="$LANGUEUTF8"
+sysrc -f /etc/profile CHARSET="UTF-8"
 
 cat > /usr/local/etc/X11/xorg.conf.d/10-keyboard.conf <<EOF
 Section "InputClass"
@@ -154,23 +172,24 @@ EOF
 echo "defaultclass = french" >> /etc/adduser.conf
 
 # Activer les services pour le bureau Mate
-sysrc moused_enable=yes dbus_enable=yes hald_enable=yes slim_enable=yes
+sysrc moused_enable=yes dbus_enable=yes hald_enable=yes slim_enable=yes mate_enable=yes
 
 # Personnaliser les autres services
 # Activer "ipv6_privacy=yes" si IPV6 est utilisé
 sysrc sendmail_enable=none clear_tmp_enable=yes background_dhclient=yes ipv6_network_interfaces=none
 
 # Optimiser le système pour un usage desktop
-setconfig -f /etc/sysctl.conf kern.sched.preempt_thresh=224
-setconfig -f /etc/sysctl.conf kern.ipc.shmmax=67108864
-setconfig -f /etc/sysctl.conf kern.ipc.shmall=32768
-setconfig -f /etc/sysctl.conf vfs.usermount=1
+echo "kern.sched.preempt_thresh=224" >> /etc/sysctl.conf
+echo "kern.ipc.shmmax=67108864" >> /etc/sysctl.conf
+echo "kern.ipc.shmall=32768" >> /etc/sysctl.conf
+echo "vfs.usermount=1" >> /etc/sysctl.conf
+echo "kern.ipc.shm_use_phys=0" >> /etc/sysctl.conf
 
 # Diminuer le timeout du menu du boot loader
 sysrc -f /boot/loader.conf autoboot_delay=3
 
 # Firewall à regarder avec "ipfw show"
-service firewall enable
+sysrc firewall_enable=yes
 sysrc firewall_type=workstation
 sysrc firewall_myservices="22/tcp"
 sysrc firewall_allowservices=any
@@ -204,14 +223,10 @@ if [ $(grep -q "/proc" "/etc/fstab"; echo $?) == 1 ]; then
 	echo "proc            /proc           procfs  rw      0       0" >> /etc/fstab
 fi
 
-# Installer le fork de mate-tweak
-fetch https://github.com/HacKurx/public-sharing/raw/master/files/station-tweak-0.7.txz
-pkg install -fy station-tweak-0.7.txz
-
 # Installer les ports
 if [ ! -d "/usr/ports" ]; then
     pkg install -fy git-lite
-    git clone --depth=1 https://github.com/HardenedBSD/hardenedbsd-ports.git /usr/ports
+    git clone --depth=1 --single-branch --branch hardenedbsd/main https://git.hardenedbsd.org/hardenedbsd/ports.git /usr/ports/
 fi
 
 # Spécifique à HardenedBSD
@@ -230,8 +245,7 @@ secadm {
 }
 EOF
 
-# Attente correction du Bug n°38 pour activation
-sysrc secadm_enable=NO
+sysrc secadm_enable=no
 #/usr/local/etc/rc.d/secadm start
 #echo ERREUR-SECADM >> "/etc/hosts"
 #grep SECADM /var/log/messages /etc/hosts
@@ -247,5 +261,16 @@ else
        service microcode_update start
 fi
 
+# Auditer les paquets
+pkg audit -F
+
 # Redémarrage
-reboot
+echo
+while :; do
+        read -p '(R)edémarrer ou (S)ortir ? ' RREBOOT
+
+        case $RREBOOT in
+        [rR]*)  reboot;;
+        [sS]*)  exit;;
+        esac
+done
