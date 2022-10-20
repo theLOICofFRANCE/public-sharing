@@ -149,10 +149,10 @@ echo -e "${HIGHLIGHT}Configuration des répertoires personnels et de l'accès au
 sed -ie '/^DIR_MODE=/ s/=[0-9]*\+/=0700/' /etc/adduser.conf
 sed -ie '/^UMASK\s\+/ s/022/077/' /etc/login.defs
 
-read -p "User shell configuration:
-[0] Set shell to /bin/passwd (allows password changes, bypassing Gnome bug) (default)
-[1] Set shell to /sbin/nologin (prevents shell access)
-[2] Set shell to /bin/bash (allows bash shell access)
+read -p "Configuration du shell de l'utilisateur :
+[0] Définissez le shell à /bin/passwd (permet de changer de mot de passe, en contournant le bug de Gnome) (par défaut)
+[1] Définissez le shell à /sbin/nologin (empêche l'accès au shell)
+[2] Définissez le shell à /bin/bash (permet l'accès au shell bash)
 " LEVEL
 	if [ "$LEVEL" == "1" ]; then
 		# Désactivez l'accès au shell pour les nouveaux utilisateurs (sans affecter l'utilisateur admin existant).
@@ -177,7 +177,7 @@ adduser "$ENDUSER"
 
 # Définir quelques profils AppArmor en mode renforcé.
 echo -e "${HIGHLIGHT}Configuration de apparmor...${NC}"
-aa-enforce /etc/apparmor.d/usr.bin.firefox
+aa-enforce /etc/apparmor.d/usr.bin.firefox || aa-enforce /usr/share/apparmor/extra-profiles/usr.lib.firefox.firefox
 aa-enforce /etc/apparmor.d/usr.sbin.avahi-daemon
 aa-enforce /etc/apparmor.d/usr.sbin.dnsmasq
 aa-enforce /etc/apparmor.d/bin.ping
@@ -332,6 +332,7 @@ chmod a+x /etc/dconf/db
 # Désactiver apport (déclaration d'erreur)
 sed -ie '/^enabled=1$/ s/1/0/' /etc/default/apport
 
+apt-get install -y dbus-x11
 sudo -H -u "$ENDUSER" dbus-launch gsettings set com.ubuntu.update-notifier show-apport-crashes false
 
 # Correction de certaines permissions dans /var qui sont inscriptibles et exécutables par l'utilisateur standard.
