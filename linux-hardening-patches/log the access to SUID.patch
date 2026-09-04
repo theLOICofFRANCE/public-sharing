@@ -11,16 +11,21 @@ Log the access to SUID. The display format is as follows:
  fs/exec.c | 2 ++
  1 file changed, 2 insertions(+)
 
+ fs/exec.c | 3 ++
+ 1 file changed, 3 insertions(+)
+
 diff --git a/fs/exec.c b/fs/exec.c
-index 69fcee853363..783c2d484316 100644
+index 69fcee853363..xxxxxxxxxxxx 100644
 --- a/fs/exec.c
 +++ b/fs/exec.c
-@@ -1535,6 +1535,8 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
+@@ -1535,6 +1535,9 @@ static void bprm_fill_uid(struct linux_binprm *bprm)
  		 !kgid_has_mapping(bprm->cred->user_ns, gid))
  		return;
  
-+	printk(KERN_ERR "linux-hardened: %s executed by the uid/euid:%u/%u just used a SUID\n", current->comm, current_uid(), current_euid());
-+
  	if (mode & S_ISUID) {
++		pr_err("linux-hardened: %s executed by the uid/euid:%u/%u just used a SUID\n",
++		       current->comm, current_uid(), current_euid());
++
  		bprm->per_clear |= PER_CLEAR_ON_SETID;
  		bprm->cred->euid = uid;
+ 	}
